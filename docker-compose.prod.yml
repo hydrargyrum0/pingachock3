@@ -1,0 +1,57 @@
+# Production stack for the shared Debian server: everything containerized
+# so it doesn't touch whatever else runs on the box. Only Caddy is exposed
+# to the host (80 for ACME renewal, 30031 for real traffic) - postgres and
+# backend are reachable only inside the compose network.
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pingachock
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: pingachock
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pingachock"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://pingachock:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/pingachock?sslmode=disable
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set in .env}
+      LISTEN_ADDR: ":8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"       # ACME HTTP-01 challenge only - keep free for renewal, see README
+      - "30031:30031" # real public traffic, pingachock.rapeer.com
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+    networks:
+      - internal
+
+networks:
+  internal:
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

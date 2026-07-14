@@ -1,0 +1,3 @@
+pingachock.rapeer.com:30031 {
+	reverse_proxy backend:8080
+}

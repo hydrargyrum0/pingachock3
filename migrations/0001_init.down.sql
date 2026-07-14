@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS results;
+DROP TABLE IF EXISTS check_runs;
+DROP TABLE IF EXISTS checks;
+DROP TYPE IF EXISTS check_run_status;
+DROP TYPE IF EXISTS check_status;
+DROP TYPE IF EXISTS check_type;
+DROP TABLE IF EXISTS nodes;
+DROP TABLE IF EXISTS api_keys;
+DROP TABLE IF EXISTS accounts;

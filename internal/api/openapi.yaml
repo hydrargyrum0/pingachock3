@@ -1,0 +1,355 @@
+openapi: 3.0.3
+info:
+  title: pingachock API
+  description: >
+    Распределённый сервис проверки доступности IP/доменов из Туркменистана.
+    См. docs/ARCHITECTURE.md в репозитории для полного описания архитектуры.
+  version: "1"
+servers:
+  - url: /
+
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /api/v1/checks:
+    post:
+      summary: Создать проверку
+      description: >
+        `target` (один) либо `targets` (массив). При массиве создаётся по одному
+        check на таргет с общим `batch_id`, декартово произведение с `node_selector`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCheckRequest'
+      responses:
+        '201':
+          description: Check создан (или батч чеков)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Check'
+                  - $ref: '#/components/schemas/BatchCheckResponse'
+        '400':
+          $ref: '#/components/responses/Error'
+        '422':
+          $ref: '#/components/responses/Error'
+    get:
+      summary: Список проверок
+      parameters:
+        - name: batch_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, running, completed, partial, failed, cancelled]
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: offset
+          in: query
+          schema: { type: integer, default: 0 }
+      responses:
+        '200':
+          description: Список чеков
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  checks:
+                    type: array
+                    items: { $ref: '#/components/schemas/Check' }
+
+  /api/v1/checks/{id}:
+    get:
+      summary: Статус и результаты проверки
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: expand
+          in: query
+          description: "`runs` - добавить детализацию по каждому узлу"
+          schema: { type: string, enum: [runs] }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Check' }
+        '404':
+          $ref: '#/components/responses/Error'
+    delete:
+      summary: Отменить pending/running проверку
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204':
+          description: Отменено
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /api/v1/nodes:
+    get:
+      summary: Список узлов
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items: { $ref: '#/components/schemas/Node' }
+    post:
+      summary: Завести новый узел (admin)
+      security:
+        - AdminAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                isp: { type: string }
+                city: { type: string }
+      responses:
+        '201':
+          description: Узел создан, секрет отдаётся один раз
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Node'
+                  - type: object
+                    properties:
+                      secret: { type: string }
+
+  /api/v1/nodes/{id}:
+    get:
+      summary: Детали узла
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /api/v1/agent/poll:
+    post:
+      summary: "Heartbeat + получение новых заданий (протокол узла)"
+      security:
+        - NodeAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                agent_version: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: '#/components/schemas/Job' }
+
+  /api/v1/agent/results:
+    post:
+      summary: "Отправка результатов (батчем; протокол узла)"
+      security:
+        - NodeAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [results]
+              properties:
+                results:
+                  type: array
+                  items: { $ref: '#/components/schemas/ResultSubmission' }
+      responses:
+        '204':
+          description: Принято
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: "`api_key`, выданный оператором (внешние приложения / веб-морда)"
+    NodeAuth:
+      type: http
+      scheme: bearer
+      description: "секрет узла, выданный при `POST /api/v1/nodes`"
+    AdminAuth:
+      type: http
+      scheme: bearer
+      description: "ADMIN_TOKEN сервера"
+
+  responses:
+    Error:
+      description: Ошибка
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+
+  schemas:
+    NodeSelector:
+      type: object
+      description: >
+        Один из трёх вариантов: node_ids (явный выбор, ждёт офлайн-узлы),
+        tags или all (по умолчанию только online, если не include_offline).
+      properties:
+        node_ids:
+          type: array
+          items: { type: string, format: uuid }
+        tags:
+          type: array
+          items: { type: string }
+        all: { type: boolean }
+        include_offline: { type: boolean }
+
+    CreateCheckRequest:
+      type: object
+      required: [type, node_selector]
+      properties:
+        type:
+          type: string
+          enum: [ping, tcp, http, dns, tls, traceroute]
+        target: { type: string, description: "один таргет" }
+        targets:
+          type: array
+          items: { type: string }
+          description: "либо массив таргетов - см. описание"
+        params:
+          type: object
+          description: "см. docs/ARCHITECTURE.md - параметры зависят от type"
+        node_selector: { $ref: '#/components/schemas/NodeSelector' }
+        callback_url: { type: string }
+      example:
+        type: ping
+        target: "1.1.1.1"
+        params: { count: 4 }
+        node_selector: { all: true }
+
+    Check:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        batch_id: { type: string, format: uuid, nullable: true }
+        type: { type: string }
+        target: { type: string }
+        params: { type: object }
+        node_selector: { type: object }
+        callback_url: { type: string, nullable: true }
+        status:
+          type: string
+          enum: [pending, running, completed, partial, failed, cancelled]
+        warnings:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time, nullable: true }
+        runs:
+          type: array
+          items: { $ref: '#/components/schemas/Run' }
+
+    BatchCheckResponse:
+      type: object
+      properties:
+        batch_id: { type: string, format: uuid }
+        checks:
+          type: array
+          items: { $ref: '#/components/schemas/Check' }
+
+    Run:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        node_name: { type: string }
+        status:
+          type: string
+          enum: [queued, dispatched, running, done, error, timeout]
+        dispatched_at: { type: string, format: date-time, nullable: true }
+        completed_at: { type: string, format: date-time, nullable: true }
+        result: { $ref: '#/components/schemas/Result' }
+
+    Result:
+      type: object
+      properties:
+        success: { type: boolean }
+        latency_ms: { type: integer, nullable: true }
+        status_code: { type: string, nullable: true }
+        error_message: { type: string, nullable: true }
+        raw: { type: object }
+
+    Node:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        isp: { type: string }
+        city: { type: string }
+        country: { type: string }
+        agent_version: { type: string }
+        online: { type: boolean }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        tags: { type: array, items: { type: string } }
+        created_at: { type: string, format: date-time }
+
+    Job:
+      type: object
+      properties:
+        check_run_id: { type: string, format: uuid }
+        type: { type: string }
+        target: { type: string }
+        params: { type: object }
+
+    ResultSubmission:
+      type: object
+      required: [check_run_id, success]
+      properties:
+        check_run_id: { type: string, format: uuid }
+        success: { type: boolean }
+        latency_ms: { type: integer }
+        status_code: { type: string }
+        error_message: { type: string }
+        raw: { type: object }
