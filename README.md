@@ -134,7 +134,14 @@ Caddyfile                 — pingachock.rapeer.com:30031 → backend:8080
 
 ### Разворачивание
 
-1. Скопировать репозиторий на сервер.
+1. Склонировать репозиторий на сервер:
+
+   ```sh
+   git clone https://github.com/hydrargyrum0/pingachock3.git /opt/pingachock
+   cd /opt/pingachock
+   ```
+
+   Обновление после изменений в коде - `git pull` в этой же директории и повторить шаг 4.
 2. Завести `.env` из примера и заполнить случайными значениями:
 
    ```sh
