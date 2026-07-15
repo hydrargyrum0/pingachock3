@@ -1,18 +1,23 @@
 // The agent doubles as its own installer and setup wizard, aimed at being
 // runnable by just right-clicking the exe -> "Run as administrator" on a
 // machine that has nothing else on it:
-//   - no arguments (bare double-click) -> `setup`: interactively (or via
-//     flags, so a shortcut can bake in the answers for unattended rollout)
-//     picks a network interface, fills in the rest of agent.json, then
-//     installs and starts the native OS service in one go.
+//   - no arguments, first run (no config yet) -> `setup`: interactively (or
+//     via flags, so a shortcut can bake in the answers for unattended
+//     rollout) picks a network interface, fills in the rest of agent.json,
+//     then installs and starts the native OS service in one go.
+//   - no arguments, already configured -> `menu`: an interactive menu to
+//     check status, reconfigure, start/stop/restart, or fully remove -
+//     re-running the wizard unprompted once it's already working would be
+//     surprising, so a repeat double-click lands here instead.
 //   - `configure` does just the config part, without installing.
 //   - `install`/`start`/`stop`/`uninstall` control the native OS service
 //     (systemd/launchd/Windows Service via kardianos/service) individually.
 //   - `run` runs in the foreground - also what the installed service execs.
 //
-// Every action pauses for a keypress before exiting (except `run`, which
-// blocks until stopped) so a double-clicked console window doesn't just
-// flash and vanish before the operator can read what happened.
+// Every action pauses for a keypress before exiting (except `run` and
+// `menu`, which have their own blocking loops) so a double-clicked console
+// window doesn't just flash and vanish before the operator can read what
+// happened.
 package main
 
 import (
@@ -38,6 +43,14 @@ import (
 )
 
 const agentVersion = "0.1.0"
+
+// stdin is shared process-wide for every interactive prompt. Deliberately a
+// single instance: bufio.Reader buffers ahead, so creating a second one
+// wrapping the same os.Stdin (e.g. one per function) silently drops
+// whatever the first one already buffered - every prompt after that point
+// reads the wrong line. Fine to share since this CLI never reads stdin
+// concurrently.
+var stdin = bufio.NewReader(os.Stdin)
 
 type program struct {
 	log        *slog.Logger
@@ -188,31 +201,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Bare double-click / "Run as administrator" with no arguments: do the
-	// whole guided setup in one shot rather than requiring separate
-	// configure/install/start invocations. Anything invoking this binary
-	// with explicit args (including the OS service manager, which always
-	// passes "run") is unaffected.
+	// Bare double-click / "Run as administrator" with no arguments: first
+	// time, run the guided setup in one shot. Once a config already exists
+	// (i.e. it's already been set up and is presumably running quietly as
+	// a service), the same bare double-click instead opens a menu to
+	// check/reconfigure/control it - re-running the full wizard unprompted
+	// would be surprising once it's already working. Anything invoking
+	// this binary with explicit args (including the OS service manager,
+	// which always passes "run") is unaffected either way.
 	if action == "" {
-		action = "setup"
+		if isConfigured(resolvedConfig) {
+			action = "menu"
+		} else {
+			action = "setup"
+		}
 	}
 
 	switch action {
 	case "setup":
 		runSetup(resolvedConfig, sf, svc)
 		pauseBeforeExit()
+	case "menu":
+		runMenu(resolvedConfig, sf, svc)
 	case "configure":
 		if err := runConfigure(resolvedConfig, sf); err != nil {
 			fmt.Fprintln(os.Stderr, "configure failed:", err)
 		}
 		pauseBeforeExit()
 	case "install", "uninstall", "start", "stop", "restart":
-		if err := service.Control(svc, action); err != nil {
-			fmt.Fprintf(os.Stderr, "%s failed: %v\n", action, err)
-			printIfPermissionError(err)
-		} else {
-			fmt.Printf("%s: ok\n", action)
-		}
+		runControlAction(svc, action)
 		pauseBeforeExit()
 	case "run":
 		if err := svc.Run(); err != nil {
@@ -265,6 +282,104 @@ func runSetup(configPath string, f setupFlags, svc service.Service) {
 	fmt.Println("Готово - узел настроен и запущен как системный сервис.")
 }
 
+func isConfigured(configPath string) bool {
+	cfg, err := config.Read(configPath)
+	if err != nil {
+		return false
+	}
+	return cfg.NodeSecret != "" && cfg.DirectURL != ""
+}
+
+func runControlAction(svc service.Service, action string) {
+	if err := service.Control(svc, action); err != nil {
+		fmt.Printf("%s: %v\n", action, err)
+		printIfPermissionError(err)
+		return
+	}
+	fmt.Printf("%s: ok\n", action)
+}
+
+func statusString(svc service.Service) string {
+	st, err := svc.Status()
+	if err != nil {
+		return fmt.Sprintf("не установлен как сервис (%v)", err)
+	}
+	switch st {
+	case service.StatusRunning:
+		return "запущен"
+	case service.StatusStopped:
+		return "остановлен"
+	default:
+		return "неизвестно"
+	}
+}
+
+// runMenu is what a repeat double-click shows once the node is already
+// configured: check status, reconfigure, control the service, or remove it
+// entirely - without having to remember any command-line flags.
+func runMenu(configPath string, f setupFlags, svc service.Service) {
+	reader := stdin
+	for {
+		cfg, _ := config.Read(configPath)
+		fmt.Println()
+		fmt.Println("=== pingachock-agent ===")
+		fmt.Printf("Статус сервиса: %s\n", statusString(svc))
+		fmt.Printf("Бекенд:         %s\n", cfg.DirectURL)
+		if cfg.FrontDomain != "" {
+			fmt.Printf("Резерв (Cloud Run): %s -> %s\n", cfg.FrontDomain, cfg.FrontRealHost)
+		}
+		fmt.Printf("Интерфейс:      %s (%s)\n", cfg.InterfaceName, cfg.LocalAddr)
+		fmt.Println()
+		fmt.Println("1) Перенастроить (интерфейс/секрет/URL/резервный канал)")
+		fmt.Println("2) Остановить сервис")
+		fmt.Println("3) Запустить сервис")
+		fmt.Println("4) Перезапустить сервис")
+		fmt.Println("5) Удалить полностью (сервис + конфиг)")
+		fmt.Println("0) Выход")
+
+		switch promptString(reader, "Выбери действие: ") {
+		case "1":
+			newCfg, err := resolveConfig(configPath, f)
+			if err != nil {
+				fmt.Println("Ошибка:", err)
+				continue
+			}
+			if err := config.Save(configPath, newCfg); err != nil {
+				fmt.Println("Ошибка:", err)
+				continue
+			}
+			fmt.Println("Конфиг сохранён.")
+			if a := promptString(reader, "Перезапустить сейчас, чтобы применить? [Y/n]: "); !strings.EqualFold(a, "n") && !strings.EqualFold(a, "no") && !strings.EqualFold(a, "нет") {
+				runControlAction(svc, "restart")
+			}
+		case "2":
+			runControlAction(svc, "stop")
+		case "3":
+			runControlAction(svc, "start")
+		case "4":
+			runControlAction(svc, "restart")
+		case "5":
+			a := promptString(reader, "Точно удалить сервис и конфиг? Это необратимо [y/N]: ")
+			if strings.EqualFold(a, "y") || strings.EqualFold(a, "yes") || strings.EqualFold(a, "д") || strings.EqualFold(a, "да") {
+				_ = service.Control(svc, "stop")
+				runControlAction(svc, "uninstall")
+				if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
+					fmt.Println("Не удалось удалить конфиг:", err)
+				} else {
+					fmt.Println("Конфиг удалён.")
+				}
+				fmt.Println("Готово. Можно закрыть окно и удалить сам .exe файл.")
+				return
+			}
+			fmt.Println("Отменено.")
+		case "0", "":
+			return
+		default:
+			fmt.Println("Не понял выбор, попробуй ещё раз.")
+		}
+	}
+}
+
 func printIfPermissionError(err error) {
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "denied") || strings.Contains(msg, "administrator") || strings.Contains(msg, "permission") {
@@ -298,7 +413,7 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 		return config.Config{}, fmt.Errorf("read existing config: %w", err)
 	}
 
-	reader := bufio.NewReader(os.Stdin)
+	reader := stdin
 
 	ifaceName := f.iface
 	if ifaceName == "" {
@@ -358,6 +473,18 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 	}
 	if f.frontRealHost != "" {
 		cfg.FrontRealHost = f.frontRealHost
+	}
+	// Only ask interactively if neither flag was given and it's not already
+	// configured - this is an optional fallback, most setups don't need it,
+	// so don't force the question when a flag-driven unattended run already
+	// answered it (or deliberately left it blank).
+	if f.frontDomain == "" && f.frontRealHost == "" && cfg.FrontDomain == "" && cfg.FrontRealHost == "" {
+		fmt.Println()
+		answer := promptString(reader, "Настроить резервный канал через Cloud Run на случай блокировки прямого доступа (direct_url)? Если не знаешь, что это - просто нажми Enter, чтобы пропустить [y/N]: ")
+		if strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes") || strings.EqualFold(answer, "д") || strings.EqualFold(answer, "да") {
+			cfg.FrontDomain = promptString(reader, "Домен для маскировки SNI (напр. google.com): ")
+			cfg.FrontRealHost = promptString(reader, "Хостнейм твоего Cloud Run сервиса (напр. xxxxx-uc.a.run.app): ")
+		}
 	}
 
 	if cfg.PollIntervalSeconds <= 0 {
@@ -421,5 +548,5 @@ func promptInt(r *bufio.Reader, label string, min, max int) int {
 func pauseBeforeExit() {
 	fmt.Println()
 	fmt.Print("Нажми Enter для выхода...")
-	bufio.NewReader(os.Stdin).ReadString('\n')
+	stdin.ReadString('\n')
 }
