@@ -1,7 +1,10 @@
 # Production stack for the shared Debian server: everything containerized
 # so it doesn't touch whatever else runs on the box. Only Caddy is exposed
-# to the host (80 for ACME renewal, 30031 for real traffic) - postgres and
-# backend are reachable only inside the compose network.
+# to the host, and only on 30031 (real traffic) - port 80 is deliberately
+# NOT published here because port 80 belongs to another site on this
+# server. Certs are issued/renewed manually with docker-compose.renew.yml,
+# see scripts/renew-cert.sh and README. Postgres and backend are reachable
+# only inside the compose network.
 services:
   postgres:
     image: postgres:16
@@ -37,8 +40,7 @@ services:
     image: caddy:2-alpine
     restart: unless-stopped
     ports:
-      - "80:80"       # ACME HTTP-01 challenge only - keep free for renewal, see README
-      - "30031:30031" # real public traffic, pingachock.rapeer.com
+      - "30031:30031" # real public traffic, pingachock.rapeer.com - no port 80 here, see above
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

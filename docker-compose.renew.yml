@@ -1,0 +1,8 @@
+# Overlay used only while renewing the TLS cert - adds port 80 back
+# temporarily (needed for the ACME HTTP-01 challenge), on top of the base
+# docker-compose.prod.yml. See scripts/renew-cert.sh.
+services:
+  caddy:
+    ports:
+      - "80:80"
+      - "30031:30031"
