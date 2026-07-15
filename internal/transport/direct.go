@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -10,7 +11,7 @@ import (
 // domain/IP. If localAddr is set (operator picked a specific network
 // interface via `configure`), outgoing connections are bound to it instead
 // of whatever the OS would pick as the default route.
-func NewDirect(localAddr net.IP, baseURL, nodeSecret string, timeout time.Duration) *HTTPTransport {
+func NewDirect(localAddr net.IP, baseURL, nodeSecret string, timeout time.Duration, log *slog.Logger) *HTTPTransport {
 	dialer := &net.Dialer{Timeout: timeout}
 	if localAddr != nil {
 		dialer.LocalAddr = &net.TCPAddr{IP: localAddr}
@@ -19,5 +20,5 @@ func NewDirect(localAddr net.IP, baseURL, nodeSecret string, timeout time.Durati
 		Timeout:   timeout,
 		Transport: &http.Transport{DialContext: dialer.DialContext},
 	}
-	return NewHTTPTransport(client, baseURL, nodeSecret)
+	return NewHTTPTransport(client, baseURL, nodeSecret, "direct", log)
 }

@@ -30,7 +30,18 @@ func (f *Failover) current() Transport {
 	return f.primary
 }
 
-func (f *Failover) markFailed(used Transport) {
+// Name reports which transport is actually active right now ("direct" or
+// "fronted") - shown in the status menu so a censorship-driven failover is
+// visible at a glance instead of silently changing behavior.
+func (f *Failover) Name() string {
+	c := f.current()
+	if n, ok := c.(interface{ Name() string }); ok {
+		return n.Name()
+	}
+	return "unknown"
+}
+
+func (f *Failover) markFailed(used Transport, cause error) {
 	if f.fallback == nil || used == f.fallback {
 		return
 	}
@@ -38,7 +49,7 @@ func (f *Failover) markFailed(used Transport) {
 	defer f.mu.Unlock()
 	if !f.useFallback {
 		f.useFallback = true
-		f.log.Warn("direct transport failed, switching to fronted transport")
+		f.log.Warn("direct transport failed, switching to fronted transport", "error", cause)
 	}
 }
 
@@ -46,7 +57,7 @@ func (f *Failover) Poll(ctx context.Context, agentVersion string) ([]Job, error)
 	c := f.current()
 	jobs, err := c.Poll(ctx, agentVersion)
 	if err != nil {
-		f.markFailed(c)
+		f.markFailed(c, err)
 	}
 	return jobs, err
 }
@@ -55,7 +66,7 @@ func (f *Failover) PostResults(ctx context.Context, results []ResultSubmission) 
 	c := f.current()
 	err := c.PostResults(ctx, results)
 	if err != nil {
-		f.markFailed(c)
+		f.markFailed(c, err)
 	}
 	return err
 }

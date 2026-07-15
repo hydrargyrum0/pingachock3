@@ -35,6 +35,8 @@ import (
 
 	"github.com/kardianos/service"
 
+	"pingachock/internal/agentlog"
+	"pingachock/internal/agentstate"
 	"pingachock/internal/checks"
 	"pingachock/internal/config"
 	"pingachock/internal/netiface"
@@ -70,6 +72,20 @@ func (p *program) Start(s service.Service) error {
 func (p *program) run(ctx context.Context) {
 	defer close(p.done)
 
+	// Running as an installed service means stdout goes nowhere anyone can
+	// see - switch to a structured JSON file log so "it says it's running
+	// but won't connect" is actually diagnosable after the fact. Falls back
+	// to the console logger (still useless for a real service, but better
+	// than crashing) if the log directory can't be created.
+	baseDir := filepath.Dir(p.configPath)
+	logsDir := filepath.Join(baseDir, "logs")
+	if fileLog, closer, err := agentlog.Setup(logsDir, 14, slog.LevelDebug); err != nil {
+		p.log.Error("failed to set up file logging, continuing with console only", "logs_dir", logsDir, "error", err)
+	} else {
+		p.log = fileLog
+		defer closer.Close()
+	}
+
 	cfg, err := config.Load(p.configPath)
 	if err != nil {
 		p.log.Error("load config", "path", p.configPath, "error", err)
@@ -82,13 +98,13 @@ func (p *program) run(ctx context.Context) {
 		localIP = net.ParseIP(cfg.LocalAddr)
 	}
 
-	direct := transport.NewDirect(localIP, cfg.DirectURL, cfg.NodeSecret, 30*time.Second)
+	direct := transport.NewDirect(localIP, cfg.DirectURL, cfg.NodeSecret, 30*time.Second, p.log)
 
 	var tr transport.Transport = direct
 	if cfg.FrontDomain != "" && cfg.FrontRealHost != "" {
-		fronted := transport.NewFronted(localIP, cfg.FrontDomain, cfg.FrontRealHost, cfg.NodeSecret, 30*time.Second)
+		fronted := transport.NewFronted(localIP, cfg.FrontDomain, cfg.FrontRealHost, cfg.NodeSecret, 30*time.Second, p.log)
 		tr = transport.NewFailover(direct, fronted, p.log)
-		p.log.Info("fronted transport configured as fallback", "front_domain", cfg.FrontDomain)
+		p.log.Info("fronted transport configured as fallback", "front_domain", cfg.FrontDomain, "front_real_host", cfg.FrontRealHost)
 	}
 
 	pl := &poller.Poller{
@@ -98,12 +114,15 @@ func (p *program) run(ctx context.Context) {
 		MaxConcurrent: cfg.MaxConcurrentChecks,
 		NetConfig:     netCfg,
 		Log:           p.log,
+		StatePath:     agentstate.Path(baseDir),
 	}
 
 	p.log.Info("agent starting",
-		"direct_url", cfg.DirectURL, "poll_interval", pl.Interval, "node_id", cfg.NodeID,
-		"interface", cfg.InterfaceName, "local_addr", cfg.LocalAddr, "dns_servers", cfg.DNSServers)
+		"agent_version", agentVersion, "direct_url", cfg.DirectURL, "poll_interval", pl.Interval, "node_id", cfg.NodeID,
+		"interface", cfg.InterfaceName, "local_addr", cfg.LocalAddr, "dns_servers", cfg.DNSServers,
+		"fronted_configured", cfg.FrontDomain != "" && cfg.FrontRealHost != "", "logs_dir", logsDir)
 	pl.Run(ctx)
+	p.log.Info("agent stopped")
 }
 
 // buildNetConfig turns the interface/DNS settings picked at setup time into
@@ -170,10 +189,10 @@ func main() {
 	fs := flag.NewFlagSet("pingachock-agent", flag.ExitOnError)
 	configPath := fs.String("config", "agent.json", "path to agent config file")
 	nodeSecret := fs.String("node-secret", "", "node secret - skips the interactive prompt")
-	directURL := fs.String("direct-url", "", "backend URL, e.g. https://backend.example.com - skips the interactive prompt")
+	directURL := fs.String("direct-url", "", "backend URL WITH scheme, e.g. https://backend.example.com:30031 - skips the interactive prompt")
 	ifaceFlag := fs.String("interface", "", `network interface name, or "auto" for the first one that's up - skips the interactive prompt`)
-	frontDomain := fs.String("front-domain", "", "fronted transport: disguise SNI domain (optional)")
-	frontRealHost := fs.String("front-real-host", "", "fronted transport: real Cloud Run hostname (optional)")
+	frontDomain := fs.String("front-domain", "", "fronted transport (optional): disguise SNI domain, bare hostname, NO https://, e.g. google.com")
+	frontRealHost := fs.String("front-real-host", "", "fronted transport (optional): real Cloud Run hostname, bare hostname, NO https://, e.g. xxxxx-uc.a.run.app")
 	fs.Parse(args)
 
 	resolvedConfig := *configPath
@@ -280,6 +299,8 @@ func runSetup(configPath string, f setupFlags, svc service.Service) {
 	fmt.Println("start: ok")
 	fmt.Println()
 	fmt.Println("Готово - узел настроен и запущен как системный сервис.")
+	fmt.Printf("Подробные логи - в папке %s (по одному файлу на день).\n", filepath.Join(filepath.Dir(configPath), "logs"))
+	fmt.Printf("Запусти этот файл ещё раз в любой момент, чтобы увидеть статус и меню управления.\n")
 }
 
 func isConfigured(configPath string) bool {
@@ -297,6 +318,25 @@ func runControlAction(svc service.Service, action string) {
 		return
 	}
 	fmt.Printf("%s: ok\n", action)
+}
+
+// formatRelative returns a complete phrase ("никогда", "12 сек назад") -
+// callers shouldn't append their own "назад", the zero-time case has none.
+func formatRelative(t time.Time) string {
+	if t.IsZero() {
+		return "никогда"
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%d сек назад", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%d мин назад", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%d ч назад", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%d дн назад", int(d.Hours()/24))
+	}
 }
 
 func statusString(svc service.Service) string {
@@ -319,11 +359,50 @@ func statusString(svc service.Service) string {
 // entirely - without having to remember any command-line flags.
 func runMenu(configPath string, f setupFlags, svc service.Service) {
 	reader := stdin
+	baseDir := filepath.Dir(configPath)
+	statePath := agentstate.Path(baseDir)
+	logsDir := filepath.Join(baseDir, "logs")
+
 	for {
 		cfg, _ := config.Read(configPath)
+		st, stErr := agentstate.Load(statePath)
+		running := false
+		if s, err := svc.Status(); err == nil && s == service.StatusRunning {
+			running = true
+		}
+
 		fmt.Println()
 		fmt.Println("=== pingachock-agent ===")
 		fmt.Printf("Статус сервиса: %s\n", statusString(svc))
+		fmt.Printf("Лог-файл:       %s\n", filepath.Join(logsDir, "agent-"+time.Now().Format("2006-01-02")+".log"))
+		fmt.Println()
+
+		if stErr != nil {
+			fmt.Println("Сводка: нет данных - сервис ещё ни разу не выходил на связь с бекендом.")
+		} else {
+			if !running {
+				fmt.Println("(сервис сейчас не запущен - сводка ниже от последнего раза, когда он работал)")
+			}
+			fmt.Printf("Транспорт:        %s\n", st.Transport)
+			if st.LastPollOK {
+				fmt.Printf("Последний опрос:  %s, успешно (заданий получено: %d)\n", formatRelative(st.LastPollAt), st.LastJobsCount)
+			} else {
+				fmt.Printf("Последний опрос:  %s, ОШИБКА: %s\n", formatRelative(st.LastPollAt), st.LastPollError)
+			}
+			if st.ConsecutivePollFails > 0 {
+				fmt.Printf("Подряд ошибок:    %d - похоже, сервис не может достучаться до бекенда\n", st.ConsecutivePollFails)
+			}
+			if !st.LastResultsAt.IsZero() {
+				if st.LastResultsOK {
+					fmt.Printf("Посл. отправка:   %s, успешно\n", formatRelative(st.LastResultsAt))
+				} else {
+					fmt.Printf("Посл. отправка:   %s, ОШИБКА: %s\n", formatRelative(st.LastResultsAt), st.LastResultsError)
+				}
+			}
+			fmt.Printf("Работает с:       %s\n", formatRelative(st.StartedAt))
+		}
+		fmt.Println()
+
 		fmt.Printf("Бекенд:         %s\n", cfg.DirectURL)
 		if cfg.FrontDomain != "" {
 			fmt.Printf("Резерв (Cloud Run): %s -> %s\n", cfg.FrontDomain, cfg.FrontRealHost)
@@ -466,7 +545,7 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 	case f.directURL != "":
 		cfg.DirectURL = f.directURL
 	case cfg.DirectURL == "":
-		cfg.DirectURL = promptString(reader, "URL бекенда (direct_url), напр. https://backend.example.com: ")
+		cfg.DirectURL = promptString(reader, "URL бекенда - ОБЯЗАТЕЛЬНО со схемой (https://), напр. https://pingachock.rapeer.com:30031: ")
 	}
 	if f.frontDomain != "" {
 		cfg.FrontDomain = f.frontDomain
@@ -482,10 +561,19 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 		fmt.Println()
 		answer := promptString(reader, "Настроить резервный канал через Cloud Run на случай блокировки прямого доступа (direct_url)? Если не знаешь, что это - просто нажми Enter, чтобы пропустить [y/N]: ")
 		if strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes") || strings.EqualFold(answer, "д") || strings.EqualFold(answer, "да") {
-			cfg.FrontDomain = promptString(reader, "Домен для маскировки SNI (напр. google.com): ")
-			cfg.FrontRealHost = promptString(reader, "Хостнейм твоего Cloud Run сервиса (напр. xxxxx-uc.a.run.app): ")
+			cfg.FrontDomain = promptString(reader, "Домен для маскировки SNI - ТОЛЬКО домен, БЕЗ https:// и БЕЗ порта (порт всегда 443), напр. google.com: ")
+			cfg.FrontRealHost = promptString(reader, "Хостнейм Cloud Run сервиса (идёт в заголовок Host) - ТОЛЬКО домен, БЕЗ https://, напр. xxxxx-uc.a.run.app: ")
 		}
 	}
+
+	// Catch the two most common mistakes automatically rather than letting
+	// them silently produce a broken config: direct_url is dialed as a full
+	// URL and needs a scheme; front_domain/front_real_host are bare
+	// hostnames the code itself dials on :443 or sends as a Host header, so
+	// a pasted https:// or trailing path/port there is always wrong.
+	cfg.DirectURL = applyNormalize("URL бекенда", cfg.DirectURL, normalizeURL)
+	cfg.FrontDomain = applyNormalize("домен для SNI", cfg.FrontDomain, normalizeBareHost)
+	cfg.FrontRealHost = applyNormalize("хостнейм Cloud Run", cfg.FrontRealHost, normalizeBareHost)
 
 	if cfg.PollIntervalSeconds <= 0 {
 		cfg.PollIntervalSeconds = 30
@@ -495,6 +583,47 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// normalizeURL ensures a scheme is present, defaulting to https:// - this
+// field gets dialed directly as a URL, so forgetting the scheme (the single
+// most common mistake here) would otherwise silently break every request.
+func normalizeURL(input string) (value string, fixed bool) {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" || strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+		return trimmed, false
+	}
+	return "https://" + trimmed, true
+}
+
+// normalizeBareHost strips a scheme/path/port a user might have mistakenly
+// included - these fields (SNI disguise domain, Cloud Run Host header
+// value) are bare hostnames, never URLs; the code always dials/sends them
+// on :443 itself.
+func normalizeBareHost(input string) (value string, fixed bool) {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return "", false
+	}
+	original := trimmed
+	if idx := strings.Index(trimmed, "://"); idx >= 0 {
+		trimmed = trimmed[idx+3:]
+	}
+	if idx := strings.Index(trimmed, "/"); idx >= 0 {
+		trimmed = trimmed[:idx]
+	}
+	if idx := strings.LastIndex(trimmed, ":"); idx >= 0 {
+		trimmed = trimmed[:idx]
+	}
+	return trimmed, trimmed != original
+}
+
+func applyNormalize(label, value string, normalize func(string) (string, bool)) string {
+	v, fixed := normalize(value)
+	if fixed {
+		fmt.Printf("(%s: поправил ввод - было %q, стало %q)\n", label, value, v)
+	}
+	return v
 }
 
 // pickInterface resolves a -interface flag value to an actual interface:

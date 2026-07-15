@@ -50,13 +50,13 @@ type checkResponse struct {
 }
 
 type runResponse struct {
-	ID           uuid.UUID             `json:"id"`
-	NodeID       uuid.UUID             `json:"node_id"`
-	NodeName     string                `json:"node_name"`
-	Status       store.CheckRunStatus  `json:"status"`
-	DispatchedAt *time.Time            `json:"dispatched_at,omitempty"`
-	CompletedAt  *time.Time            `json:"completed_at,omitempty"`
-	Result       *resultResponse       `json:"result,omitempty"`
+	ID           uuid.UUID            `json:"id"`
+	NodeID       uuid.UUID            `json:"node_id"`
+	NodeName     string               `json:"node_name"`
+	Status       store.CheckRunStatus `json:"status"`
+	DispatchedAt *time.Time           `json:"dispatched_at,omitempty"`
+	CompletedAt  *time.Time           `json:"completed_at,omitempty"`
+	Result       *resultResponse      `json:"result,omitempty"`
 }
 
 type resultResponse struct {
