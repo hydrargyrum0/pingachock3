@@ -27,3 +27,21 @@ func (s *Store) GetAccount(ctx context.Context, id uuid.UUID) (Account, error) {
 	}
 	return a, err
 }
+
+func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, name, created_at FROM accounts ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Account
+	for rows.Next() {
+		var a Account
+		if err := rows.Scan(&a.ID, &a.Name, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}

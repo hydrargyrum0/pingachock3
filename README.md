@@ -36,20 +36,22 @@ go run ./cmd/server
 | `SWEEP_INTERVAL_SECONDS` | `30` | как часто проверяются зависшие check_runs |
 | `SWEEP_GRACE_SECONDS` | `600` | через сколько зависший check_run таймаутится |
 
-### 3. Завести тестовый аккаунт и API-ключ
+### 3. Завести аккаунт и API-ключ
 
-Пока нет self-serve эндпоинта для ключей (см. ARCHITECTURE.md) - создаются вручную:
+Через admin API (`ADMIN_TOKEN`), не через psql:
 
 ```sh
-psql "postgres://pingachock:pingachock@localhost:5433/pingachock?sslmode=disable" -c \
-  "INSERT INTO accounts (name) VALUES ('my-account') RETURNING id;"
+ACCOUNT_ID=$(curl -sS -X POST http://localhost:8080/api/v1/accounts \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"my-account"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
 
-# hash = sha256(token), храним только хэш
-TOKEN="мой-секретный-ключ"
-HASH=$(printf '%s' "$TOKEN" | shasum -a 256 | awk '{print $1}')
-psql "postgres://pingachock:pingachock@localhost:5433/pingachock?sslmode=disable" -c \
-  "INSERT INTO api_keys (account_id, key_hash, label) VALUES ('<account_id>', '$HASH', 'dev');"
+curl -sS -X POST "http://localhost:8080/api/v1/accounts/$ACCOUNT_ID/api-keys" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"label":"dev"}'
+# ответ содержит "token" - сохрани его, повторно не покажется (хранится только хэш)
 ```
+
+Список ключей аккаунта (без самих токенов) - `GET .../api-keys`; отозвать - `DELETE /api/v1/api-keys/{id}`.
 
 ### 4. Завести узел
 
@@ -187,9 +189,9 @@ scripts/renew-cert.sh     — ручное продление сертифика
    Интерактивная документация API (Swagger UI, с возможностью выполнять запросы прямо из
    браузера через "Try it out") - `https://pingachock.rapeer.com:30031/docs`.
 
-5. Дальше — как в локальном разделе выше: завести аккаунт/api-ключ через `psql`
-   (`docker compose -f docker-compose.prod.yml exec postgres psql -U pingachock -d pingachock`),
-   завести узлы через `POST /api/v1/nodes` с `ADMIN_TOKEN`.
+5. Дальше — как в локальном разделе выше: завести аккаунт/api-ключ через
+   `POST /api/v1/accounts` + `POST /api/v1/accounts/{id}/api-keys` (или прямо из `/docs`),
+   завести узлы через `POST /api/v1/nodes` - всё с `ADMIN_TOKEN`.
 
 6. Если уже поднят Cloud Run fronting-прокси (см. ниже) - обновить его `BACKEND_URL` на
    `https://pingachock.rapeer.com:30031`.

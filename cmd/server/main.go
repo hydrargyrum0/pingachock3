@@ -87,6 +87,11 @@ func main() {
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireAdminToken(adminToken))
 			r.Post("/nodes", publicH.CreateNode)
+			r.Post("/accounts", publicH.CreateAccount)
+			r.Get("/accounts", publicH.ListAccounts)
+			r.Post("/accounts/{accountID}/api-keys", publicH.CreateAPIKey)
+			r.Get("/accounts/{accountID}/api-keys", publicH.ListAPIKeys)
+			r.Delete("/api-keys/{id}", publicH.RevokeAPIKey)
 		})
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireNodeSecret(st))
