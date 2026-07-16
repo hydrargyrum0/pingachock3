@@ -28,7 +28,9 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -195,29 +197,15 @@ func main() {
 	frontRealHost := fs.String("front-real-host", "", "fronted transport (optional): real Cloud Run hostname, bare hostname, NO https://, e.g. xxxxx-uc.a.run.app")
 	fs.Parse(args)
 
+	exePath, exeErr := os.Executable()
 	resolvedConfig := *configPath
-	if !filepath.IsAbs(resolvedConfig) {
-		if exe, err := os.Executable(); err == nil {
-			resolvedConfig = filepath.Join(filepath.Dir(exe), resolvedConfig)
-		}
+	if !filepath.IsAbs(resolvedConfig) && exeErr == nil {
+		resolvedConfig = filepath.Join(filepath.Dir(exePath), resolvedConfig)
 	}
 
 	sf := setupFlags{
 		nodeSecret: *nodeSecret, directURL: *directURL, iface: *ifaceFlag,
 		frontDomain: *frontDomain, frontRealHost: *frontRealHost,
-	}
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	prg := &program{log: logger, configPath: resolvedConfig}
-	svc, err := service.New(prg, &service.Config{
-		Name:        "pingachock-agent",
-		DisplayName: "Pingachock Node Agent",
-		Description: "Runs network availability checks dispatched by the pingachock backend.",
-		Arguments:   []string{"run", "-config", resolvedConfig},
-	})
-	if err != nil {
-		logger.Error("init service", "error", err)
-		os.Exit(1)
 	}
 
 	// Bare double-click / "Run as administrator" with no arguments: first
@@ -234,6 +222,33 @@ func main() {
 		} else {
 			action = "setup"
 		}
+	}
+
+	// Before installing as a system service, get off any directory known to
+	// cause silent permission failures for a service process: macOS TCC
+	// gates Documents/Desktop/Downloads even for root, and Windows
+	// Defender's Controlled Folder Access protects the same set by default
+	// for SYSTEM-run processes. Both bit us for real during rollout - see
+	// docs/ARCHITECTURE.md. Re-execs from the new location and never
+	// returns if it relocates.
+	if exeErr == nil && (action == "setup" || action == "install") {
+		if newExe, newConfig, relocated := relocateIfRisky(exePath, resolvedConfig); relocated {
+			fmt.Printf("Папка %s не подходит для системного сервиса (ограничения ОС на этот каталог) - переношу в %s...\n\n", filepath.Dir(exePath), filepath.Dir(newExe))
+			reExecFrom(newExe, buildReExecArgs(action, newConfig, sf))
+		}
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	prg := &program{log: logger, configPath: resolvedConfig}
+	svc, err := service.New(prg, &service.Config{
+		Name:        "pingachock-agent",
+		DisplayName: "Pingachock Node Agent",
+		Description: "Runs network availability checks dispatched by the pingachock backend.",
+		Arguments:   []string{"run", "-config", resolvedConfig},
+	})
+	if err != nil {
+		logger.Error("init service", "error", err)
+		os.Exit(1)
 	}
 
 	switch action {
@@ -291,7 +306,7 @@ func runSetup(configPath string, f setupFlags, svc service.Service) {
 	}
 
 	fmt.Println("Запускаю сервис...")
-	if err := service.Control(svc, "start"); err != nil {
+	if err := startService(svc); err != nil {
 		fmt.Printf("start: %v\n", err)
 		printIfPermissionError(err)
 		return
@@ -312,12 +327,68 @@ func isConfigured(configPath string) bool {
 }
 
 func runControlAction(svc service.Service, action string) {
-	if err := service.Control(svc, action); err != nil {
-		fmt.Printf("%s: %v\n", action, err)
-		printIfPermissionError(err)
-		return
+	switch action {
+	case "start":
+		if err := startService(svc); err != nil {
+			fmt.Printf("start: %v\n", err)
+			printIfPermissionError(err)
+			return
+		}
+		fmt.Println("start: ok")
+	case "restart":
+		_ = service.Control(svc, "stop") // best-effort - fine if it wasn't running
+		if err := startService(svc); err != nil {
+			fmt.Printf("restart: %v\n", err)
+			printIfPermissionError(err)
+			return
+		}
+		fmt.Println("restart: ok")
+	default:
+		if err := service.Control(svc, action); err != nil {
+			fmt.Printf("%s: %v\n", action, err)
+			printIfPermissionError(err)
+			return
+		}
+		fmt.Printf("%s: ok\n", action)
 	}
-	fmt.Printf("%s: ok\n", action)
+}
+
+// startService wraps service.Control(svc, "start") with a macOS-specific
+// recovery path: kardianos drives launchd via the old `launchctl load`
+// API, which we hit failing with a bare, undiagnosable
+// "Load failed: 5: Input/output error" after install/uninstall cycles -
+// bootout-ing any stale registration and bootstrap-ing fresh is what
+// actually fixed it when debugged by hand, so do that automatically before
+// giving up.
+func startService(svc service.Service) error {
+	err := service.Control(svc, "start")
+	if err == nil {
+		return nil
+	}
+	if runtime.GOOS != "darwin" {
+		return err
+	}
+	fmt.Println("start через launchctl load не сработал, пробую launchctl bootstrap напрямую...")
+	if rerr := darwinBootstrapRecover(svc); rerr != nil {
+		fmt.Println("bootstrap тоже не помог:", rerr)
+		return err
+	}
+	fmt.Println("сработало через bootstrap.")
+	return nil
+}
+
+func darwinBootstrapRecover(svc service.Service) error {
+	const plistPath = "/Library/LaunchDaemons/pingachock-agent.plist"
+	exec.Command("launchctl", "bootout", "system/pingachock-agent").Run() // best-effort, fine if not currently loaded
+	out, err := exec.Command("launchctl", "bootstrap", "system", plistPath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("launchctl bootstrap: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	time.Sleep(time.Second)
+	if st, err := svc.Status(); err != nil || st != service.StatusRunning {
+		return fmt.Errorf("service still not running after bootstrap")
+	}
+	return nil
 }
 
 // formatRelative returns a complete phrase ("никогда", "12 сек назад") -
@@ -466,6 +537,114 @@ func printIfPermissionError(err error) {
 	}
 }
 
+// riskyDir reports whether dir is somewhere a system service reading files
+// from it can silently fail: macOS TCC gates Documents/Desktop/Downloads
+// even for root; Windows Defender's Controlled Folder Access protects the
+// same set by default for SYSTEM-run processes. Hit this for real on both
+// during rollout.
+func riskyDir(dir string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	dirLower := strings.ToLower(dir)
+	for _, name := range []string{"Documents", "Desktop", "Downloads", "Pictures", "Movies", "Music"} {
+		risky := strings.ToLower(filepath.Join(home, name))
+		if dirLower == risky || strings.HasPrefix(dirLower, risky+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// safeInstallDir is where the agent relocates itself to before installing
+// as a system service, if it finds itself in a riskyDir.
+func safeInstallDir() string {
+	if runtime.GOOS == "windows" {
+		base := os.Getenv("ProgramData")
+		if base == "" {
+			base = `C:\ProgramData`
+		}
+		return filepath.Join(base, "pingachock-agent")
+	}
+	return "/usr/local/pingachock-agent"
+}
+
+// relocateIfRisky copies the running binary (and existing config, if any)
+// out of a riskyDir into safeInstallDir(). Best-effort: any failure to
+// create the destination or copy just returns relocated=false rather than
+// an error, so the caller falls back to installing from the original path
+// (where it'll either work fine or fail with a clearer permission error).
+func relocateIfRisky(exePath, configPath string) (newExe, newConfig string, relocated bool) {
+	exeDir := filepath.Dir(exePath)
+	if !riskyDir(exeDir) {
+		return exePath, configPath, false
+	}
+	dest := safeInstallDir()
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "не удалось создать %s (%v) - продолжаю из текущей папки, но она может быть недоступна сервису\n", dest, err)
+		return exePath, configPath, false
+	}
+	newExePath := filepath.Join(dest, filepath.Base(exePath))
+	if err := copyFile(exePath, newExePath, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "не удалось скопировать себя в %s (%v) - продолжаю из текущей папки\n", dest, err)
+		return exePath, configPath, false
+	}
+	newConfigPath := filepath.Join(dest, filepath.Base(configPath))
+	if _, err := os.Stat(configPath); err == nil {
+		_ = copyFile(configPath, newConfigPath, 0o600)
+	}
+	return newExePath, newConfigPath, true
+}
+
+func copyFile(src, dst string, perm os.FileMode) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, perm)
+}
+
+// reExecFrom hands off to the relocated binary and never returns - the
+// current process's job ends with relaying the child's exit code.
+func reExecFrom(exePath string, args []string) {
+	cmd := exec.Command(exePath, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		fmt.Fprintln(os.Stderr, "перезапуск из новой папки не удался:", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// buildReExecArgs carries forward whatever flags were given on the original
+// invocation (an unattended flag-driven run shouldn't lose them) plus the
+// new config path.
+func buildReExecArgs(action, cfgPath string, f setupFlags) []string {
+	args := []string{action, "-config", cfgPath}
+	if f.nodeSecret != "" {
+		args = append(args, "-node-secret", f.nodeSecret)
+	}
+	if f.directURL != "" {
+		args = append(args, "-direct-url", f.directURL)
+	}
+	if f.iface != "" {
+		args = append(args, "-interface", f.iface)
+	}
+	if f.frontDomain != "" {
+		args = append(args, "-front-domain", f.frontDomain)
+	}
+	if f.frontRealHost != "" {
+		args = append(args, "-front-real-host", f.frontRealHost)
+	}
+	return args
+}
+
 // runConfigure resolves the config (same logic as setup) and saves it
 // without touching the OS service - for reviewing/editing before install.
 func runConfigure(configPath string, f setupFlags) error {
@@ -481,11 +660,17 @@ func runConfigure(configPath string, f setupFlags) error {
 	return nil
 }
 
-// resolveConfig fills in interface/DNS/node_secret/direct_url: from flags
-// where given, from the existing config file where already set, prompting
-// interactively for whatever's still missing. See internal/netiface for why
-// interface/DNS selection matters (a VPN's DNS would otherwise silently
-// skew every check).
+// resolveConfig fills in node_secret/direct_url/interface: from flags where
+// given, from the existing config file where already set, prompting
+// interactively for whatever's still missing.
+//
+// Interface selection happens *after* direct_url/front_domain are known and
+// *tests real reachability* through each candidate rather than trusting
+// "administratively up" - a VPN client, iCloud Private Relay, or any other
+// system-level tunnel silently rewriting the default route is extremely
+// common, and "up" doesn't mean "this interface's raw path can reach the
+// backend". Found this the hard way: an interface that looked fine hung for
+// 30s on every single poll. See docs/ARCHITECTURE.md.
 func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 	cfg, err := config.Read(configPath)
 	if err != nil {
@@ -493,47 +678,6 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 	}
 
 	reader := stdin
-
-	ifaceName := f.iface
-	if ifaceName == "" {
-		ifaceName = cfg.InterfaceName // keep previous choice if nothing new specified
-	}
-
-	var selected netiface.Interface
-	if ifaceName != "" {
-		selected, err = pickInterface(ifaceName)
-		if err != nil {
-			return config.Config{}, err
-		}
-	} else {
-		ifaces, err := netiface.List()
-		if err != nil {
-			return config.Config{}, fmt.Errorf("list network interfaces: %w", err)
-		}
-		if len(ifaces) == 0 {
-			return config.Config{}, fmt.Errorf("no usable network interfaces found")
-		}
-		fmt.Println("Доступные сетевые интерфейсы:")
-		for i, ifc := range ifaces {
-			status := "down"
-			if ifc.IsUp {
-				status = "up"
-			}
-			fmt.Printf("  [%d] %-15s %-4s %v\n", i+1, ifc.Name, status, ifc.Addrs)
-		}
-		idx := promptInt(reader, fmt.Sprintf("Выбери интерфейс (1-%d): ", len(ifaces)), 1, len(ifaces))
-		selected = ifaces[idx-1]
-	}
-
-	dnsServers, dnsErr := netiface.DNSServers(selected.Name)
-	if dnsErr != nil || len(dnsServers) == 0 {
-		fmt.Println("Не удалось определить DNS этого интерфейса - будет использован системный резолвер.")
-	} else {
-		fmt.Printf("DNS этого интерфейса: %s\n", strings.Join(dnsServers, ", "))
-	}
-	cfg.InterfaceName = selected.Name
-	cfg.LocalAddr = selected.Addrs[0].String()
-	cfg.DNSServers = dnsServers
 
 	switch {
 	case f.nodeSecret != "":
@@ -575,6 +719,21 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 	cfg.FrontDomain = applyNormalize("домен для SNI", cfg.FrontDomain, normalizeBareHost)
 	cfg.FrontRealHost = applyNormalize("хостнейм Cloud Run", cfg.FrontRealHost, normalizeBareHost)
 
+	selected, err := chooseInterface(reader, f.iface, cfg)
+	if err != nil {
+		return config.Config{}, err
+	}
+
+	dnsServers, dnsErr := netiface.DNSServers(selected.Name)
+	if dnsErr != nil || len(dnsServers) == 0 {
+		fmt.Println("Не удалось определить DNS этого интерфейса - будет использован системный резолвер.")
+	} else {
+		fmt.Printf("DNS этого интерфейса: %s\n", strings.Join(dnsServers, ", "))
+	}
+	cfg.InterfaceName = selected.Name
+	cfg.LocalAddr = selected.Addrs[0].String()
+	cfg.DNSServers = dnsServers
+
 	if cfg.PollIntervalSeconds <= 0 {
 		cfg.PollIntervalSeconds = 30
 	}
@@ -583,6 +742,143 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// probeTimeout is deliberately much shorter than the real 30s client
+// timeout used at runtime - this is just "can this interface reach the
+// backend at all", not a tolerance test, and a human is waiting on it.
+const probeTimeout = 8 * time.Second
+
+type interfaceProbe struct {
+	iface     netiface.Interface
+	directOK  bool
+	frontedOK bool
+	err       error
+}
+
+func (p interfaceProbe) ok() bool { return p.directOK || p.frontedOK }
+
+func (p interfaceProbe) describe() string {
+	switch {
+	case p.directOK:
+		return "OK (прямое подключение)"
+	case p.frontedOK:
+		return "OK (только через резервный канал - прямой недоступен с этого интерфейса)"
+	default:
+		return fmt.Sprintf("недоступен: %v", p.err)
+	}
+}
+
+// probeInterface tests reachability by making a real (short-timeout) call
+// to the actual /agent/poll protocol through this interface - not a plain
+// /healthz check, deliberately: the fronting proxy only forwards
+// /api/v1/agent/* (see deploy/fronting-proxy), so a healthz-based probe
+// would misreport a working fronted path as broken. This also means it's
+// testing with the real node_secret, which is known by this point in
+// resolveConfig.
+func probeInterface(ifc netiface.Interface, cfg config.Config) interfaceProbe {
+	res := interfaceProbe{iface: ifc}
+	localIP := ifc.Addrs[0]
+
+	direct := transport.NewDirect(localIP, cfg.DirectURL, cfg.NodeSecret, probeTimeout, nil)
+	if err := probePoll(direct); err == nil {
+		res.directOK = true
+		return res
+	} else {
+		res.err = err
+	}
+
+	if cfg.FrontDomain != "" && cfg.FrontRealHost != "" {
+		fronted := transport.NewFronted(localIP, cfg.FrontDomain, cfg.FrontRealHost, cfg.NodeSecret, probeTimeout, nil)
+		if err := probePoll(fronted); err == nil {
+			res.frontedOK = true
+		}
+	}
+	return res
+}
+
+// probePoll calls Poll with a bounded context purely to test reachability.
+// Any non-2xx response (e.g. a rejected node_secret) still counts as
+// "unreachable" here for simplicity, but the underlying error text is
+// preserved in interfaceProbe.err and shown to the operator, so a wrong
+// secret reads as "status 401: ..." rather than a vague timeout.
+func probePoll(tr transport.Transport) error {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	_, err := tr.Poll(ctx, "probe")
+	return err
+}
+
+// chooseInterface picks a network interface, actively testing whether
+// cfg.DirectURL (and the fronted fallback, if configured) is actually
+// reachable through each candidate - see resolveConfig's doc comment for
+// why "administratively up" isn't good enough.
+func chooseInterface(reader *bufio.Reader, ifaceFlag string, cfg config.Config) (netiface.Interface, error) {
+	ifaces, err := netiface.List()
+	if err != nil {
+		return netiface.Interface{}, fmt.Errorf("list network interfaces: %w", err)
+	}
+	if len(ifaces) == 0 {
+		return netiface.Interface{}, fmt.Errorf("no usable network interfaces found")
+	}
+
+	// An explicit non-auto choice (flag, or carried over from a previous
+	// run): honor it, but still probe and warn loudly - an unattended/
+	// scripted run shouldn't block on a transient failure, but silently
+	// saving a config that can never connect is exactly the bug this
+	// whole function exists to prevent.
+	if ifaceFlag != "" && ifaceFlag != "auto" {
+		selected, err := pickInterface(ifaceFlag)
+		if err != nil {
+			return netiface.Interface{}, err
+		}
+		fmt.Printf("Проверяю доступность бекенда через %s... ", selected.Name)
+		res := probeInterface(selected, cfg)
+		fmt.Println(res.describe())
+		if !res.ok() {
+			fmt.Println("ВНИМАНИЕ: этот интерфейс не может достучаться до бекенда прямо сейчас.")
+			fmt.Println("Агент всё равно будет использовать его - если это временная проблема, ничего")
+			fmt.Println("делать не надо; если нет, перезапусти `configure` без -interface, чтобы")
+			fmt.Println("выбрать другой (не обязательно самый очевидный - часто мешает VPN/relay).")
+		}
+		return selected, nil
+	}
+
+	fmt.Println("Проверяю доступность бекенда через каждый сетевой интерфейс...")
+	probes := make([]interfaceProbe, len(ifaces))
+	for i, ifc := range ifaces {
+		fmt.Printf("  [%d] %-15s %v ... ", i+1, ifc.Name, ifc.Addrs)
+		probes[i] = probeInterface(ifc, cfg)
+		fmt.Println(probes[i].describe())
+	}
+
+	firstWorking := -1
+	for i, p := range probes {
+		if p.ok() {
+			firstWorking = i
+			break
+		}
+	}
+
+	if ifaceFlag == "auto" {
+		if firstWorking == -1 {
+			return netiface.Interface{}, fmt.Errorf("ни один сетевой интерфейс не смог достучаться до бекенда (%s) - проверь direct_url/резервный канал и подключение к интернету", cfg.DirectURL)
+		}
+		fmt.Printf("Выбран интерфейс %s (первый рабочий).\n", ifaces[firstWorking].Name)
+		return ifaces[firstWorking], nil
+	}
+
+	// Fully interactive with no -interface given at all: let the operator
+	// pick from the now-annotated list, defaulting to the first one that
+	// actually works.
+	defaultIdx := firstWorking + 1
+	label := fmt.Sprintf("Выбери интерфейс (1-%d)", len(ifaces))
+	if defaultIdx > 0 {
+		label += fmt.Sprintf(", Enter = %d", defaultIdx)
+	}
+	label += ": "
+	idx := promptIntDefault(reader, label, 1, len(ifaces), defaultIdx)
+	return ifaces[idx-1], nil
 }
 
 // normalizeURL ensures a scheme is present, defaulting to https:// - this
@@ -659,11 +955,18 @@ func promptString(r *bufio.Reader, label string) string {
 	return strings.TrimSpace(line)
 }
 
-func promptInt(r *bufio.Reader, label string, min, max int) int {
+// promptIntDefault prompts for an integer in [min, max]; empty input (bare
+// Enter) returns def if it's in range - used to pre-select the interface
+// that already tested as reachable.
+func promptIntDefault(r *bufio.Reader, label string, min, max, def int) int {
 	for {
 		fmt.Print(label)
 		line, _ := r.ReadString('\n')
-		n, err := strconv.Atoi(strings.TrimSpace(line))
+		line = strings.TrimSpace(line)
+		if line == "" && def >= min && def <= max {
+			return def
+		}
+		n, err := strconv.Atoi(line)
 		if err == nil && n >= min && n <= max {
 			return n
 		}
