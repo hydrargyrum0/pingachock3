@@ -95,16 +95,18 @@ func (p *program) run(ctx context.Context) {
 	}
 
 	netCfg := buildNetConfig(cfg)
-	var localIP net.IP
-	if cfg.LocalAddr != "" {
-		localIP = net.ParseIP(cfg.LocalAddr)
-	}
 
-	direct := transport.NewDirect(localIP, cfg.DirectURL, cfg.NodeSecret, 30*time.Second, p.log)
+	// cfg.LocalAddr is the interface picked for running checks (see
+	// buildNetConfig above) - backend communication is deliberately NOT
+	// bound to it and always goes over the OS's default route instead. A
+	// bound path can be unreachable (blocked route, ISP quirk) even when
+	// the default route works fine - hit this for real in production, see
+	// docs/ARCHITECTURE.md.
+	direct := transport.NewDirect(nil, cfg.DirectURL, cfg.NodeSecret, 30*time.Second, p.log)
 
 	var tr transport.Transport = direct
 	if cfg.FrontDomain != "" && cfg.FrontRealHost != "" {
-		fronted := transport.NewFronted(localIP, cfg.FrontDomain, cfg.FrontRealHost, cfg.NodeSecret, 30*time.Second, p.log)
+		fronted := transport.NewFronted(nil, cfg.FrontDomain, cfg.FrontRealHost, cfg.NodeSecret, 30*time.Second, p.log)
 		tr = transport.NewFailover(direct, fronted, p.log)
 		p.log.Info("fronted transport configured as fallback", "front_domain", cfg.FrontDomain, "front_real_host", cfg.FrontRealHost)
 	}
@@ -535,7 +537,7 @@ func runMenu(configPath string, f setupFlags, svc service.Service) {
 		if cfg.FrontDomain != "" {
 			fmt.Printf("Резерв (Cloud Run): %s -> %s\n", cfg.FrontDomain, cfg.FrontRealHost)
 		}
-		fmt.Printf("Интерфейс:      %s (%s)\n", cfg.InterfaceName, cfg.LocalAddr)
+		fmt.Printf("Интерфейс проверок: %s (%s) - с бекендом агент общается через системный маршрут по умолчанию\n", cfg.InterfaceName, cfg.LocalAddr)
 		fmt.Println()
 		fmt.Println("1) Перенастроить (интерфейс/секрет/URL/резервный канал)")
 		fmt.Println("2) Остановить сервис")
@@ -818,6 +820,23 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 	warnIfNotHostname("домен для SNI", cfg.FrontDomain)
 	warnIfNotHostname("хостнейм Cloud Run", cfg.FrontRealHost)
 
+	// Backend reachability is checked once here, over the OS default route -
+	// the same path the running agent actually uses (see program.Start/run).
+	// Deliberately NOT tied to interface selection below: that used to probe
+	// each candidate interface *bound*, which can fail for reasons that
+	// don't affect the unbound default route at all (real production case:
+	// a bound path to the fronting proxy's resolved IP got "unreachable
+	// network" from Windows while the default route would have gone
+	// through fine) - see docs/ARCHITECTURE.md.
+	fmt.Print("Проверяю связь с бекендом (через маршрут по умолчанию - так же, как будет работать агент)... ")
+	if label, err := probeBackend(cfg); err == nil {
+		fmt.Printf("OK (%s)\n", label)
+	} else {
+		fmt.Printf("не получилось: %v\n", err)
+		fmt.Println("ВНИМАНИЕ: проверь node_secret / URL бекенда / резервный канал - возможно, где-то опечатка.")
+		fmt.Println("Настройки всё равно будут сохранены - если проблема временная, агент подключится сам.")
+	}
+
 	selected, err := chooseInterface(reader, f.iface, cfg)
 	if err != nil {
 		return config.Config{}, err
@@ -844,9 +863,41 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 }
 
 // probeTimeout is deliberately much shorter than the real 30s client
-// timeout used at runtime - this is just "can this interface reach the
-// backend at all", not a tolerance test, and a human is waiting on it.
+// timeout used at runtime - a human is waiting on these checks.
 const probeTimeout = 8 * time.Second
+
+// probeBackend checks that the backend is reachable over the OS default
+// route - unbound, deliberately: this is exactly the path the running
+// agent uses (see program.Start/run), so it validates node_secret/
+// direct_url/the fronted fallback are actually correct, independent of
+// whatever interface gets chosen below for running checks.
+func probeBackend(cfg config.Config) (transportLabel string, err error) {
+	direct := transport.NewDirect(nil, cfg.DirectURL, cfg.NodeSecret, probeTimeout, nil)
+	if pollErr := probePoll(direct); pollErr == nil {
+		return "direct", nil
+	} else {
+		err = pollErr
+	}
+	if cfg.FrontDomain != "" && cfg.FrontRealHost != "" {
+		fronted := transport.NewFronted(nil, cfg.FrontDomain, cfg.FrontRealHost, cfg.NodeSecret, probeTimeout, nil)
+		if pollErr := probePoll(fronted); pollErr == nil {
+			return "fronted", nil
+		}
+	}
+	return "", err
+}
+
+// probePoll calls Poll with a bounded context purely to test reachability.
+// Any non-2xx response (e.g. a rejected node_secret) still counts as
+// "unreachable" here for simplicity, but the underlying error text is
+// preserved and shown to the operator, so a wrong secret reads as
+// "status 401: ..." rather than a vague timeout.
+func probePoll(tr transport.Transport) error {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	_, err := tr.Poll(ctx, "probe")
+	return err
+}
 
 type interfaceProbe struct {
 	iface     netiface.Interface
@@ -860,21 +911,24 @@ func (p interfaceProbe) ok() bool { return p.directOK || p.frontedOK }
 func (p interfaceProbe) describe() string {
 	switch {
 	case p.directOK:
-		return "OK (прямое подключение)"
+		return "OK"
 	case p.frontedOK:
-		return "OK (только через резервный канал - прямой недоступен с этого интерфейса)"
+		return "OK (только резервный путь)"
 	default:
-		return fmt.Sprintf("недоступен: %v", p.err)
+		return fmt.Sprintf("нет связи: %v", p.err)
 	}
 }
 
-// probeInterface tests reachability by making a real (short-timeout) call
-// to the actual /agent/poll protocol through this interface - not a plain
-// /healthz check, deliberately: the fronting proxy only forwards
-// /api/v1/agent/* (see deploy/fronting-proxy), so a healthz-based probe
-// would misreport a working fronted path as broken. This also means it's
-// testing with the real node_secret, which is known by this point in
-// resolveConfig.
+// probeInterface tests whether ifc, bound as the local source address, has
+// real outbound connectivity - this is only about which interface checks
+// (ping/tcp/http/dns against check targets) run through, NOT backend
+// communication, which always uses the unbound default route (see
+// probeBackend). It uses the backend as a convenient real target that's
+// guaranteed to exist rather than a hardcoded third-party host, but a
+// failure here says nothing about backend reachability - a bound path can
+// be blocked for reasons that don't affect the unbound default route at
+// all (see docs/ARCHITECTURE.md), so this is purely informational and
+// never blocks setup.
 func probeInterface(ifc netiface.Interface, cfg config.Config) interfaceProbe {
 	res := interfaceProbe{iface: ifc}
 	localIP := ifc.Addrs[0]
@@ -896,22 +950,15 @@ func probeInterface(ifc netiface.Interface, cfg config.Config) interfaceProbe {
 	return res
 }
 
-// probePoll calls Poll with a bounded context purely to test reachability.
-// Any non-2xx response (e.g. a rejected node_secret) still counts as
-// "unreachable" here for simplicity, but the underlying error text is
-// preserved in interfaceProbe.err and shown to the operator, so a wrong
-// secret reads as "status 401: ..." rather than a vague timeout.
-func probePoll(tr transport.Transport) error {
-	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-	defer cancel()
-	_, err := tr.Poll(ctx, "probe")
-	return err
-}
-
-// chooseInterface picks a network interface, actively testing whether
-// cfg.DirectURL (and the fronted fallback, if configured) is actually
-// reachable through each candidate - see resolveConfig's doc comment for
-// why "administratively up" isn't good enough.
+// chooseInterface picks which network interface checks (ping/tcp/http/dns
+// against check targets) run through - it has no effect on backend
+// communication, which always goes over the OS default route (see
+// probeBackend, called earlier in resolveConfig). Connectivity is probed
+// purely as an informational signal ("administratively up" isn't the same
+// as "actually has a working path out") and never blocks setup - a probe
+// failure here doesn't mean the agent can't work, only that checks run
+// through this interface might not either, and the operator can always
+// pick a different one later via `configure`.
 func chooseInterface(reader *bufio.Reader, ifaceFlag string, cfg config.Config) (netiface.Interface, error) {
 	ifaces, err := netiface.List()
 	if err != nil {
@@ -921,29 +968,17 @@ func chooseInterface(reader *bufio.Reader, ifaceFlag string, cfg config.Config) 
 		return netiface.Interface{}, fmt.Errorf("no usable network interfaces found")
 	}
 
-	// An explicit non-auto choice (flag, or carried over from a previous
-	// run): honor it, but still probe and warn loudly - an unattended/
-	// scripted run shouldn't block on a transient failure, but silently
-	// saving a config that can never connect is exactly the bug this
-	// whole function exists to prevent.
 	if ifaceFlag != "" && ifaceFlag != "auto" {
 		selected, err := pickInterface(ifaceFlag)
 		if err != nil {
 			return netiface.Interface{}, err
 		}
-		fmt.Printf("Проверяю доступность бекенда через %s... ", selected.Name)
-		res := probeInterface(selected, cfg)
-		fmt.Println(res.describe())
-		if !res.ok() {
-			fmt.Println("ВНИМАНИЕ: этот интерфейс не может достучаться до бекенда прямо сейчас.")
-			fmt.Println("Агент всё равно будет использовать его - если это временная проблема, ничего")
-			fmt.Println("делать не надо; если нет, перезапусти `configure` без -interface, чтобы")
-			fmt.Println("выбрать другой (не обязательно самый очевидный - часто мешает VPN/relay).")
-		}
+		fmt.Printf("Проверяю связь через %s (для проверок)... ", selected.Name)
+		fmt.Println(probeInterface(selected, cfg).describe())
 		return selected, nil
 	}
 
-	fmt.Println("Проверяю доступность бекенда через каждый сетевой интерфейс...")
+	fmt.Println("Проверяю связь каждого сетевого интерфейса (для проверок - на связь с бекендом не влияет)...")
 	probes := make([]interfaceProbe, len(ifaces))
 	for i, ifc := range ifaces {
 		fmt.Printf("  [%d] %-15s %v ... ", i+1, ifc.Name, ifc.Addrs)
@@ -960,16 +995,19 @@ func chooseInterface(reader *bufio.Reader, ifaceFlag string, cfg config.Config) 
 	}
 
 	if ifaceFlag == "auto" {
-		if firstWorking == -1 {
-			return netiface.Interface{}, fmt.Errorf("ни один сетевой интерфейс не смог достучаться до бекенда (%s) - проверь direct_url/резервный канал и подключение к интернету", cfg.DirectURL)
+		idx := firstWorking
+		if idx == -1 {
+			idx = 0
+			fmt.Println("Ни один интерфейс не подтвердил связь при проверке - беру первый по списку.")
+			fmt.Println("Если проверки не будут идти, перезапусти `configure` и выбери другой вручную.")
 		}
-		fmt.Printf("Выбран интерфейс %s (первый рабочий).\n", ifaces[firstWorking].Name)
-		return ifaces[firstWorking], nil
+		fmt.Printf("Выбран интерфейс %s.\n", ifaces[idx].Name)
+		return ifaces[idx], nil
 	}
 
 	// Fully interactive with no -interface given at all: let the operator
 	// pick from the now-annotated list, defaulting to the first one that
-	// actually works.
+	// actually showed connectivity (if any).
 	defaultIdx := firstWorking + 1
 	label := fmt.Sprintf("Выбери интерфейс (1-%d)", len(ifaces))
 	if defaultIdx > 0 {
