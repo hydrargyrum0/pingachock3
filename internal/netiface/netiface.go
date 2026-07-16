@@ -1,16 +1,20 @@
 // Package netiface lets the operator pick which network interface the agent
 // should run checks through, and discovers that interface's own DNS servers
 // - deliberately not the system-wide resolver, which can be silently
-// overridden by a VPN client. See docs/ARCHITECTURE.md and the `configure`
-// command in cmd/agent.
+// overridden by a VPN client. It also flags which interfaces are backed by
+// real hardware (IsPhysical) versus a VPN/tunnel/virtual adapter, since
+// running checks through a VPN would measure what the VPN's exit node sees,
+// not what the local ISP actually does - the whole point of this agent. See
+// docs/ARCHITECTURE.md and the `configure` command in cmd/agent.
 package netiface
 
 import "net"
 
 type Interface struct {
-	Name  string
-	Addrs []net.IP
-	IsUp  bool
+	Name       string
+	Addrs      []net.IP
+	IsUp       bool
+	IsPhysical bool
 }
 
 // List returns non-loopback interfaces that have at least one non-link-local
@@ -48,9 +52,10 @@ func List() ([]Interface, error) {
 			continue
 		}
 		out = append(out, Interface{
-			Name:  ifc.Name,
-			Addrs: ips,
-			IsUp:  ifc.Flags&net.FlagUp != 0,
+			Name:       ifc.Name,
+			Addrs:      ips,
+			IsUp:       ifc.Flags&net.FlagUp != 0,
+			IsPhysical: isPhysical(ifc.Name),
 		})
 	}
 	return out, nil

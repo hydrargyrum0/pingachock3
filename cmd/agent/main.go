@@ -975,47 +975,81 @@ func chooseInterface(reader *bufio.Reader, ifaceFlag string, cfg config.Config) 
 		}
 		fmt.Printf("Проверяю связь через %s (для проверок)... ", selected.Name)
 		fmt.Println(probeInterface(selected, cfg).describe())
+		if !selected.IsPhysical {
+			fmt.Printf("ВНИМАНИЕ: %s похож на VPN/туннель, а не физический адаптер - проверки через него\n", selected.Name)
+			fmt.Println("покажут то, что видит VPN, а не реальный провайдер. Если это не намеренно,")
+			fmt.Println("перезапусти `configure` без -interface и выбери физический вручную.")
+		}
 		return selected, nil
 	}
 
 	fmt.Println("Проверяю связь каждого сетевого интерфейса (для проверок - на связь с бекендом не влияет)...")
 	probes := make([]interfaceProbe, len(ifaces))
 	for i, ifc := range ifaces {
-		fmt.Printf("  [%d] %-15s %v ... ", i+1, ifc.Name, ifc.Addrs)
+		fmt.Printf("  [%d] %-15s %-24v %s ... ", i+1, ifc.Name, ifc.Addrs, physicalTag(ifc))
 		probes[i] = probeInterface(ifc, cfg)
 		fmt.Println(probes[i].describe())
 	}
 
-	firstWorking := -1
-	for i, p := range probes {
-		if p.ok() {
-			firstWorking = i
-			break
-		}
-	}
+	defaultIdx := pickDefaultInterface(ifaces, probes)
 
 	if ifaceFlag == "auto" {
-		idx := firstWorking
-		if idx == -1 {
+		idx := defaultIdx
+		if idx < 0 {
 			idx = 0
-			fmt.Println("Ни один интерфейс не подтвердил связь при проверке - беру первый по списку.")
-			fmt.Println("Если проверки не будут идти, перезапусти `configure` и выбери другой вручную.")
 		}
 		fmt.Printf("Выбран интерфейс %s.\n", ifaces[idx].Name)
 		return ifaces[idx], nil
 	}
 
 	// Fully interactive with no -interface given at all: let the operator
-	// pick from the now-annotated list, defaulting to the first one that
-	// actually showed connectivity (if any).
-	defaultIdx := firstWorking + 1
+	// pick from the now-annotated list, defaulting to whatever
+	// pickDefaultInterface picked.
 	label := fmt.Sprintf("Выбери интерфейс (1-%d)", len(ifaces))
-	if defaultIdx > 0 {
-		label += fmt.Sprintf(", Enter = %d", defaultIdx)
+	if defaultIdx >= 0 {
+		label += fmt.Sprintf(", Enter = %d", defaultIdx+1)
 	}
 	label += ": "
-	idx := promptIntDefault(reader, label, 1, len(ifaces), defaultIdx)
+	idx := promptIntDefault(reader, label, 1, len(ifaces), defaultIdx+1)
 	return ifaces[idx-1], nil
+}
+
+// physicalTag labels an interface in the setup listing so the operator can
+// see at a glance why one gets preferred over another.
+func physicalTag(ifc netiface.Interface) string {
+	if ifc.IsPhysical {
+		return "(физический)"
+	}
+	return "(VPN/туннель)"
+}
+
+// pickDefaultInterface chooses which interface to default to, in order of
+// preference: a physical interface that also showed connectivity, then any
+// physical interface (even if the probe was inconclusive - see
+// probeInterface's doc comment for why a probe failure doesn't mean much),
+// then falls back to any interface that showed connectivity. Physical is
+// preferred over VPN/tunnel on principle, not just when the probe agrees -
+// running checks through a VPN measures what the VPN's exit node sees, not
+// what the local ISP actually does, which defeats the entire point of this
+// agent (see docs/ARCHITECTURE.md). Returns -1 if nothing qualifies, in
+// which case the operator must pick explicitly.
+func pickDefaultInterface(ifaces []netiface.Interface, probes []interfaceProbe) int {
+	for i, ifc := range ifaces {
+		if ifc.IsPhysical && probes[i].ok() {
+			return i
+		}
+	}
+	for i, ifc := range ifaces {
+		if ifc.IsPhysical {
+			return i
+		}
+	}
+	for i, p := range probes {
+		if p.ok() {
+			return i
+		}
+	}
+	return -1
 }
 
 // normalizeURL ensures a scheme is present, defaulting to https:// - this

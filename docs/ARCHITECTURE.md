@@ -168,6 +168,16 @@ VPN. Поэтому:
   (`internal/netiface.DNSServers`, per-OS: `resolvectl`/`resolv.conf` на Linux, `scutil --dns`
   на macOS, `ipconfig /all` на Windows) и сохраняет выбор в `agent.json`
   (`interface_name`, `local_addr`, `dns_servers`).
+- Каждый интерфейс помечен `IsPhysical` (`internal/netiface`, per-OS: на Linux — наличие
+  `/sys/class/net/<iface>/device` (символ настоящего оборудования, у tun/tap/wg/veth/docker
+  его нет), на macOS — присутствие в `networksetup -listallhardwareports`, на Windows —
+  `Get-NetAdapter -Physical`). При автовыборе (`-interface=auto` и дефолт в интерактивном
+  режиме) `pickDefaultInterface` **сознательно** предпочитает физический интерфейс даже
+  тому VPN/туннелю, который прямо сейчас единственный достучался до бекенда при пробе — это
+  не баг, а осознанная политика: гонять проверки через VPN означает мерить то, что видит
+  выходной узел VPN, а не то, что реально видит провайдер узла, что убивает весь смысл этого
+  агента. При явном `-interface=NAME` на не-физический интерфейс — не блокирует, но выводит
+  явное предупреждение.
 - Всё это превращается в `checks.NetConfig{LocalAddr, Resolver}`, который прокидывается в
   каждый `Checker.Run` через `poller.Poller` — tcp/http биндят исходящее соединение через
   `net.Dialer.LocalAddr` и резолвят через `net.Dialer.Resolver`; `ping` (шеллаут в системный
