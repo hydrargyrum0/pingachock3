@@ -281,6 +281,7 @@ func main() {
 // flags) then installs and starts the OS service - the one-shot flow behind
 // a bare double-click.
 func runSetup(configPath string, f setupFlags, svc service.Service) {
+	clearScreen()
 	cfg, err := resolveConfig(configPath, f)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "setup failed:", err)
@@ -410,6 +411,20 @@ func formatRelative(t time.Time) string {
 	}
 }
 
+// clearScreen resets the terminal before each interactive screen - cmd.exe
+// doesn't reliably honor the ANSI clear sequence, so shell out to `cls`
+// there instead of relying on an escape code.
+func clearScreen() {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/c", "cls")
+	} else {
+		cmd = exec.Command("clear")
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Run()
+}
+
 func statusString(svc service.Service) string {
 	st, err := svc.Status()
 	if err != nil {
@@ -435,6 +450,7 @@ func runMenu(configPath string, f setupFlags, svc service.Service) {
 	logsDir := filepath.Join(baseDir, "logs")
 
 	for {
+		clearScreen()
 		cfg, _ := config.Read(configPath)
 		st, stErr := agentstate.Load(statePath)
 		running := false
@@ -648,6 +664,7 @@ func buildReExecArgs(action, cfgPath string, f setupFlags) []string {
 // runConfigure resolves the config (same logic as setup) and saves it
 // without touching the OS service - for reviewing/editing before install.
 func runConfigure(configPath string, f setupFlags) error {
+	clearScreen()
 	cfg, err := resolveConfig(configPath, f)
 	if err != nil {
 		return err
@@ -718,6 +735,8 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 	cfg.DirectURL = applyNormalize("URL бекенда", cfg.DirectURL, normalizeURL)
 	cfg.FrontDomain = applyNormalize("домен для SNI", cfg.FrontDomain, normalizeBareHost)
 	cfg.FrontRealHost = applyNormalize("хостнейм Cloud Run", cfg.FrontRealHost, normalizeBareHost)
+	warnIfNotHostname("домен для SNI", cfg.FrontDomain)
+	warnIfNotHostname("хостнейм Cloud Run", cfg.FrontRealHost)
 
 	selected, err := chooseInterface(reader, f.iface, cfg)
 	if err != nil {
@@ -920,6 +939,42 @@ func applyNormalize(label, value string, normalize func(string) (string, bool)) 
 		fmt.Printf("(%s: поправил ввод - было %q, стало %q)\n", label, value, v)
 	}
 	return v
+}
+
+// looksLikeHostname is a light sanity check, not real DNS validation - it
+// exists specifically to catch the mistake seen in production: a node
+// secret (64-char hex string) pasted into front_domain instead of an actual
+// domain. Deliberately permissive on everything else - it only warns, never
+// blocks, so it doesn't need to fully replicate hostname grammar.
+func looksLikeHostname(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, r := range s {
+		isLetterDigit := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+		if !isLetterDigit && r != '-' && r != '.' {
+			return false
+		}
+	}
+	if !strings.Contains(s, ".") && len(s) >= 32 && isHexString(s) {
+		return false
+	}
+	return true
+}
+
+func isHexString(s string) bool {
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func warnIfNotHostname(label, value string) {
+	if !looksLikeHostname(value) {
+		fmt.Printf("ВНИМАНИЕ: значение %q для %q не похоже на нормальный домен - проверь, не вставил ли туда что-то другое по ошибке (например, node secret).\n", value, label)
+	}
 }
 
 // pickInterface resolves a -interface flag value to an actual interface:
