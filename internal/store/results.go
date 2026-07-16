@@ -32,7 +32,7 @@ func (s *Store) ListRunsForCheck(ctx context.Context, checkID uuid.UUID) ([]RunW
 		var success *bool
 		var latency *int
 		var statusCode, errMsg *string
-		var raw json.RawMessage
+		var raw []byte
 		var resCreatedAt *time.Time
 
 		if err := rows.Scan(
@@ -51,7 +51,7 @@ func (s *Store) ListRunsForCheck(ctx context.Context, checkID uuid.UUID) ([]RunW
 				LatencyMs:    latency,
 				StatusCode:   statusCode,
 				ErrorMessage: errMsg,
-				Raw:          raw,
+				Raw:          json.RawMessage(raw),
 				CreatedAt:    *resCreatedAt,
 			}
 		}
