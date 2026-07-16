@@ -203,6 +203,21 @@ func main() {
 		resolvedConfig = filepath.Join(filepath.Dir(exePath), resolvedConfig)
 	}
 
+	// This copy of the exe might be sitting somewhere with no config next
+	// to it (a stray Desktop/Downloads shortcut, a copy someone grabbed
+	// off a USB stick, ...) while the node was already set up from a
+	// different copy and relocated to the canonical system location below.
+	// Only kick in for the default relative config path - an explicit
+	// -config always means exactly that path, no fallback. Without this,
+	// double-clicking the "wrong" copy would silently offer to set up a
+	// second, disconnected install instead of managing the real one.
+	if *configPath == "agent.json" && !isConfigured(resolvedConfig) {
+		if canonical := filepath.Join(safeInstallDir(), filepath.Base(*configPath)); canonical != resolvedConfig && isConfigured(canonical) {
+			fmt.Printf("Рядом с этим файлом конфига нет, но узел уже настроен и работает (конфиг: %s) - использую его.\n\n", canonical)
+			resolvedConfig = canonical
+		}
+	}
+
 	sf := setupFlags{
 		nodeSecret: *nodeSecret, directURL: *directURL, iface: *ifaceFlag,
 		frontDomain: *frontDomain, frontRealHost: *frontRealHost,
@@ -224,16 +239,20 @@ func main() {
 		}
 	}
 
-	// Before installing as a system service, get off any directory known to
-	// cause silent permission failures for a service process: macOS TCC
-	// gates Documents/Desktop/Downloads even for root, and Windows
-	// Defender's Controlled Folder Access protects the same set by default
-	// for SYSTEM-run processes. Both bit us for real during rollout - see
-	// docs/ARCHITECTURE.md. Re-execs from the new location and never
-	// returns if it relocates.
-	if exeErr == nil && (action == "setup" || action == "install") {
+	// Get off any directory that isn't actually usable for a system
+	// service before touching it further: macOS TCC gates
+	// Documents/Desktop/Downloads even for root, Windows Defender's
+	// Controlled Folder Access protects the same set by default for
+	// SYSTEM-run processes, and beyond those known cases, relocateIfRisky
+	// also actively tests whether the folder is writable at all (locked-
+	// down folder, read-only mount, network share, ...) so this works from
+	// literally any starting directory, not just the ones bitten by name
+	// during rollout - see docs/ARCHITECTURE.md. Re-execs from the new
+	// location and never returns if it relocates; reports the problem and
+	// exits if the directory is unusable and relocation itself fails.
+	if exeErr == nil && (action == "setup" || action == "install" || action == "configure" || action == "menu") {
 		if newExe, newConfig, relocated := relocateIfRisky(exePath, resolvedConfig); relocated {
-			fmt.Printf("Папка %s не подходит для системного сервиса (ограничения ОС на этот каталог) - переношу в %s...\n\n", filepath.Dir(exePath), filepath.Dir(newExe))
+			fmt.Printf("Папка %s не подходит для работы сервиса - переношу в %s...\n\n", filepath.Dir(exePath), filepath.Dir(newExe))
 			reExecFrom(newExe, buildReExecArgs(action, newConfig, sf))
 		}
 	}
@@ -586,31 +605,70 @@ func safeInstallDir() string {
 	return "/usr/local/pingachock-agent"
 }
 
+// canWriteDir reports whether dir is actually writable, by attempting a
+// real write rather than trusting a fixed list of folder names - this is
+// what lets the agent run from literally any starting directory and still
+// notice a problem riskyDir doesn't know the name of (an unlisted
+// Defender/AV-protected folder, a read-only mount, a network share without
+// write access, etc).
+func canWriteDir(dir string) bool {
+	probe := filepath.Join(dir, ".pingachock-write-test")
+	f, err := os.Create(probe)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	os.Remove(probe)
+	return true
+}
+
 // relocateIfRisky copies the running binary (and existing config, if any)
-// out of a riskyDir into safeInstallDir(). Best-effort: any failure to
-// create the destination or copy just returns relocated=false rather than
-// an error, so the caller falls back to installing from the original path
-// (where it'll either work fine or fail with a clearer permission error).
+// out of a directory it can't safely run a service from into
+// safeInstallDir(). If neither the current directory nor the standard
+// system location turns out to be usable, reports why and exits rather
+// than silently continuing into a less clear failure the next time the
+// directory is touched (config save, log write, service install, ...).
 func relocateIfRisky(exePath, configPath string) (newExe, newConfig string, relocated bool) {
 	exeDir := filepath.Dir(exePath)
-	if !riskyDir(exeDir) {
+	if !riskyDir(exeDir) && canWriteDir(exeDir) {
 		return exePath, configPath, false
 	}
 	dest := safeInstallDir()
+	if filepath.Clean(exeDir) == filepath.Clean(dest) {
+		reportDirProblem(exeDir, dest, fmt.Errorf("папка недоступна для записи"))
+	}
 	if err := os.MkdirAll(dest, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "не удалось создать %s (%v) - продолжаю из текущей папки, но она может быть недоступна сервису\n", dest, err)
-		return exePath, configPath, false
+		reportDirProblem(exeDir, dest, err)
 	}
 	newExePath := filepath.Join(dest, filepath.Base(exePath))
 	if err := copyFile(exePath, newExePath, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "не удалось скопировать себя в %s (%v) - продолжаю из текущей папки\n", dest, err)
-		return exePath, configPath, false
+		reportDirProblem(exeDir, dest, err)
 	}
 	newConfigPath := filepath.Join(dest, filepath.Base(configPath))
 	if _, err := os.Stat(configPath); err == nil {
 		_ = copyFile(configPath, newConfigPath, 0o600)
 	}
 	return newExePath, newConfigPath, true
+}
+
+// reportDirProblem explains that neither the current directory nor the
+// standard system install location could be used, and what to do about
+// it, then exits.
+func reportDirProblem(exeDir, dest string, err error) {
+	fmt.Println()
+	fmt.Println("ПРОБЛЕМА: не получилось найти рабочую папку для узла.")
+	fmt.Printf("  Текущая папка (%s) недоступна для записи.\n", exeDir)
+	fmt.Printf("  Перенос в стандартную папку (%s) тоже не удался: %v\n", dest, err)
+	fmt.Println()
+	fmt.Println("Как исправить:")
+	if runtime.GOOS == "windows" {
+		fmt.Println(`  - запусти этот файл через ПКМ -> "Запуск от имени администратора";`)
+	} else {
+		fmt.Println("  - запусти этот файл через sudo;")
+	}
+	fmt.Printf("  - или вручную перенеси .exe в папку, где точно есть право на запись (например, %s), и запусти оттуда.\n", dest)
+	pauseBeforeExit()
+	os.Exit(1)
 }
 
 func copyFile(src, dst string, perm os.FileMode) error {
@@ -1016,14 +1074,24 @@ func promptString(r *bufio.Reader, label string) string {
 func promptIntDefault(r *bufio.Reader, label string, min, max, def int) int {
 	for {
 		fmt.Print(label)
-		line, _ := r.ReadString('\n')
+		line, readErr := r.ReadString('\n')
 		line = strings.TrimSpace(line)
 		if line == "" && def >= min && def <= max {
 			return def
 		}
-		n, err := strconv.Atoi(line)
-		if err == nil && n >= min && n <= max {
+		n, convErr := strconv.Atoi(line)
+		if convErr == nil && n >= min && n <= max {
 			return n
+		}
+		// No valid line and nothing left to read (closed/non-interactive
+		// stdin, no usable default) - looping here would spin forever
+		// instead of ever finishing. Report it and bail rather than hang.
+		if readErr != nil {
+			fmt.Println()
+			fmt.Println("Не удалось прочитать ввод (нет интерактивного терминала?).")
+			fmt.Println("Для запуска без вопросов используй флаги: -node-secret, -direct-url, -interface и т.д.")
+			pauseBeforeExit()
+			os.Exit(1)
 		}
 		fmt.Printf("Введи число от %d до %d.\n", min, max)
 	}
