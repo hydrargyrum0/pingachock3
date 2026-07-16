@@ -2,8 +2,12 @@
 # into /etc/nginx/conf.d/nginx.conf at container start. ${PORT} is injected
 # by Cloud Run; ${BACKEND_URL} (scheme+host, no path, e.g.
 # https://backend.example.com) is set as a Cloud Run env var pointing at the
-# Debian server.
-resolver 8.8.8.8 1.1.1.1 valid=30s ipv6=off;
+# Debian server. ${NGINX_LOCAL_RESOLVERS} comes from the stock image's
+# 15-local-resolvers.envsh (enabled via NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1
+# in the Dockerfile) - Cloud Run's network doesn't reliably let containers
+# reach hardcoded public DNS servers directly, so use whatever resolver
+# /etc/resolv.conf inside the container actually points at.
+resolver ${NGINX_LOCAL_RESOLVERS} valid=30s ipv6=off;
 
 server {
     listen ${PORT};
@@ -29,6 +33,14 @@ server {
         set $backend ${BACKEND_URL};
         proxy_pass $backend;
         proxy_http_version 1.1;
+
+        # Without this, nginx sends no SNI on the TLS handshake to the
+        # HTTPS upstream by default - Caddy (which routes/picks a cert by
+        # SNI) then has nothing to match and drops the handshake with a
+        # TLS "internal_error" alert. Confirmed via a real 502 in
+        # production; the user's own working vless-reverse image already
+        # sets this for exactly this reason.
+        proxy_ssl_server_name on;
 
         proxy_set_header Host $proxy_host;
         proxy_set_header X-Real-IP $remote_addr;
