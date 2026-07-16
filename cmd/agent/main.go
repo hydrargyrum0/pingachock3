@@ -181,6 +181,8 @@ type setupFlags struct {
 }
 
 func main() {
+	requireElevated()
+
 	args := os.Args[1:]
 	action := ""
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -428,6 +430,26 @@ func formatRelative(t time.Time) string {
 	default:
 		return fmt.Sprintf("%d дн назад", int(d.Hours()/24))
 	}
+}
+
+// requireElevated refuses to run at all without admin/root rights - every
+// action this binary has (installing/controlling a system service, writing
+// to the standard system install location) needs them anyway, and running
+// unprivileged just to fail confusingly partway through (or worse, silently
+// succeed against a directory that later turns out unusable to the actual
+// service) is worse than refusing up front with a clear fix.
+func requireElevated() {
+	if isElevated() {
+		return
+	}
+	fmt.Println("Этот файл нужно запускать с правами администратора.")
+	if runtime.GOOS == "windows" {
+		fmt.Println(`Правой кнопкой мыши по файлу -> "Запуск от имени администратора".`)
+	} else {
+		fmt.Printf("Запусти через sudo: sudo ./%s\n", filepath.Base(os.Args[0]))
+	}
+	pauseBeforeExit()
+	os.Exit(1)
 }
 
 // clearScreen resets the terminal before each interactive screen - cmd.exe
