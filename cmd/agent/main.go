@@ -288,16 +288,60 @@ func main() {
 	case "install", "uninstall", "start", "stop", "restart":
 		runControlAction(svc, action)
 		pauseBeforeExit()
+	case "update":
+		if err := runUpdate(resolvedConfig, svc); err != nil {
+			fmt.Fprintln(os.Stderr, "update failed:", err)
+			printIfPermissionError(err)
+		}
+		pauseBeforeExit()
 	case "run":
 		if err := svc.Run(); err != nil {
 			logger.Error("run", "error", err)
 			os.Exit(1)
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\nusage: %s [setup|configure|install|uninstall|start|stop|restart|run] [flags]\n", action, filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "unknown command %q\nusage: %s [setup|configure|install|uninstall|start|stop|restart|update|run] [flags]\n", action, filepath.Base(os.Args[0]))
 		pauseBeforeExit()
 		os.Exit(1)
 	}
+}
+
+// runUpdate replaces the installed service binary with whatever exe is
+// currently running, without touching agent.json - for shipping a new
+// agent version to an already-configured node: download the new release
+// (same filename as always - build-agent.sh's output names are fixed per
+// OS/arch across versions) and run `update`, or pick it from the menu.
+// If already running from the canonical install location (the operator
+// replaced the file there directly, e.g. via scp), just restarts to pick
+// up the new content - no copy needed.
+func runUpdate(configPath string, svc service.Service) error {
+	if !isConfigured(configPath) {
+		return fmt.Errorf("узел ещё не настроен - сначала используй setup")
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("determine own path: %w", err)
+	}
+	dest := filepath.Join(safeInstallDir(), filepath.Base(exePath))
+
+	fmt.Println("Останавливаю сервис...")
+	_ = service.Control(svc, "stop") // best-effort - fine if it wasn't running
+
+	if filepath.Clean(exePath) != filepath.Clean(dest) {
+		fmt.Printf("Копирую новый файл в %s...\n", dest)
+		if err := copyFile(exePath, dest, 0o755); err != nil {
+			return fmt.Errorf("copy new binary to %s: %w", dest, err)
+		}
+	} else {
+		fmt.Println("Уже запущен из установленной папки - обновляю на месте.")
+	}
+
+	fmt.Println("Запускаю сервис...")
+	if err := startService(svc); err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	fmt.Println("Готово - бинарник обновлён, agent.json не менялся.")
+	return nil
 }
 
 // runSetup resolves the config (prompting for whatever wasn't given via
@@ -544,6 +588,7 @@ func runMenu(configPath string, f setupFlags, svc service.Service) {
 		fmt.Println("3) Запустить сервис")
 		fmt.Println("4) Перезапустить сервис")
 		fmt.Println("5) Удалить полностью (сервис + конфиг)")
+		fmt.Println("6) Обновить бинарник сервиса (на новую версию, конфиг не трогается)")
 		fmt.Println("0) Выход")
 
 		switch promptString(reader, "Выбери действие: ") {
@@ -581,6 +626,12 @@ func runMenu(configPath string, f setupFlags, svc service.Service) {
 				return
 			}
 			fmt.Println("Отменено.")
+		case "6":
+			if err := runUpdate(configPath, svc); err != nil {
+				fmt.Println("Ошибка:", err)
+				printIfPermissionError(err)
+			}
+			promptString(reader, "Нажми Enter, чтобы вернуться в меню...")
 		case "0", "":
 			return
 		default:
