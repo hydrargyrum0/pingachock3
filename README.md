@@ -155,7 +155,7 @@ curl http://localhost:8080/api/v1/checks/<id>?expand=runs \
 хосте.
 
 ```
-docker-compose.prod.yml   — postgres + backend + caddy (без порта 80)
+docker-compose.prod.yml   — postgres + backend + bot + caddy (без порта 80)
 docker-compose.renew.yml  — overlay, добавляет порт 80 только на время продления
 Dockerfile                — образ бекенда (миграции применяются сами при старте)
 Caddyfile                 — pingachock.rapeer.com:30031 → backend:8080

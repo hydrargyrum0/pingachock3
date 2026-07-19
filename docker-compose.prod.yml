@@ -36,6 +36,21 @@ services:
     networks:
       - internal
 
+  bot:
+    build: ./bot
+    restart: unless-stopped
+    environment:
+      telegram_bot_token: ${TELEGRAM_BOT_TOKEN:?set in .env}
+      telegram_bot_admin_id: ${TELEGRAM_BOT_ADMIN_ID:?set in .env}
+      DB_PATH: /app/data/users.db
+      SETTINGS_DB_PATH: /app/data/settings.db
+    volumes:
+      - bot_data:/app/data
+    depends_on:
+      - backend
+    networks:
+      - internal
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
@@ -57,3 +72,4 @@ volumes:
   pgdata:
   caddy_data:
   caddy_config:
+  bot_data:
