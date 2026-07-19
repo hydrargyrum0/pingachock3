@@ -1,0 +1,2 @@
+ALTER TABLE nodes DROP COLUMN platform;
+ALTER TABLE nodes DROP COLUMN blocked;
