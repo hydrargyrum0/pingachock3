@@ -49,6 +49,10 @@ func Resolve(ctx context.Context, s *store.Store, sel NodeSelector, onlineThresh
 				warnings = append(warnings, fmt.Sprintf("node %s not found", id))
 				continue
 			}
+			if n.Blocked {
+				warnings = append(warnings, fmt.Sprintf("node %s (%s) is blocked, skipped", n.ID, n.Name))
+				continue
+			}
 			ids = append(ids, id)
 			if !n.Online(onlineThreshold) {
 				warnings = append(warnings, fmt.Sprintf("node %s (%s) is currently offline, run will wait for it to reconnect", n.ID, n.Name))
@@ -61,23 +65,31 @@ func Resolve(ctx context.Context, s *store.Store, sel NodeSelector, onlineThresh
 		if err != nil {
 			return nil, nil, fmt.Errorf("list nodes: %w", err)
 		}
-		return filterOnline(nodes, sel.IncludeOffline, onlineThreshold), nil, nil
+		return filterAvailable(nodes, sel.IncludeOffline, onlineThreshold), nil, nil
 
 	case len(sel.Tags) > 0:
 		nodes, err := s.ListNodesByAnyTag(ctx, sel.Tags)
 		if err != nil {
 			return nil, nil, fmt.Errorf("list nodes by tag: %w", err)
 		}
-		return filterOnline(nodes, sel.IncludeOffline, onlineThreshold), nil, nil
+		return filterAvailable(nodes, sel.IncludeOffline, onlineThreshold), nil, nil
 
 	default:
 		return nil, nil, ErrEmptySelector
 	}
 }
 
-func filterOnline(nodes []store.Node, includeOffline bool, threshold time.Duration) []uuid.UUID {
+// filterAvailable returns the IDs of nodes eligible for new dispatch: never
+// blocked, and either online or includeOffline is set. Blocked nodes are
+// excluded unconditionally here - unlike node_ids (explicit choice, gets a
+// warning), all/tags selection is "what's available right now", so a
+// blocked node just doesn't show up, same as it not existing.
+func filterAvailable(nodes []store.Node, includeOffline bool, threshold time.Duration) []uuid.UUID {
 	ids := make([]uuid.UUID, 0, len(nodes))
 	for _, n := range nodes {
+		if n.Blocked {
+			continue
+		}
 		if includeOffline || n.Online(threshold) {
 			ids = append(ids, n.ID)
 		}
