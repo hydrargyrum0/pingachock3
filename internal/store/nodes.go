@@ -8,13 +8,13 @@ import (
 	"github.com/google/uuid"
 )
 
-const nodeColumns = `id, name, isp, city, country, agent_version, last_heartbeat_at, secret_hash, tags, metadata, created_at`
+const nodeColumns = `id, name, isp, city, country, agent_version, platform, last_heartbeat_at, secret_hash, blocked, tags, metadata, created_at`
 
 func scanNode(row interface {
 	Scan(dest ...any) error
 }) (Node, error) {
 	var n Node
-	err := row.Scan(&n.ID, &n.Name, &n.ISP, &n.City, &n.Country, &n.AgentVersion, &n.LastHeartbeatAt, &n.SecretHash, &n.Tags, &n.Metadata, &n.CreatedAt)
+	err := row.Scan(&n.ID, &n.Name, &n.ISP, &n.City, &n.Country, &n.AgentVersion, &n.Platform, &n.LastHeartbeatAt, &n.SecretHash, &n.Blocked, &n.Tags, &n.Metadata, &n.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Node{}, ErrNotFound
 	}
@@ -83,7 +83,7 @@ func scanNodes(rows *sql.Rows) ([]Node, error) {
 	var nodes []Node
 	for rows.Next() {
 		var n Node
-		if err := rows.Scan(&n.ID, &n.Name, &n.ISP, &n.City, &n.Country, &n.AgentVersion, &n.LastHeartbeatAt, &n.SecretHash, &n.Tags, &n.Metadata, &n.CreatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.Name, &n.ISP, &n.City, &n.Country, &n.AgentVersion, &n.Platform, &n.LastHeartbeatAt, &n.SecretHash, &n.Blocked, &n.Tags, &n.Metadata, &n.CreatedAt); err != nil {
 			return nil, err
 		}
 		nodes = append(nodes, n)
@@ -99,4 +99,24 @@ func (s *Store) TouchHeartbeat(ctx context.Context, id uuid.UUID) error {
 func (s *Store) SetNodeAgentVersion(ctx context.Context, id uuid.UUID, version string) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE nodes SET agent_version = $2 WHERE id = $1`, id, version)
 	return err
+}
+
+func (s *Store) SetNodePlatform(ctx context.Context, id uuid.UUID, platform string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE nodes SET platform = $2 WHERE id = $1`, id, platform)
+	return err
+}
+
+func (s *Store) SetNodeBlocked(ctx context.Context, id uuid.UUID, blocked bool) error {
+	res, err := s.DB.ExecContext(ctx, `UPDATE nodes SET blocked = $2 WHERE id = $1`, id, blocked)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

@@ -31,8 +31,10 @@ type Node struct {
 	City            string
 	Country         string
 	AgentVersion    string
+	Platform        string
 	LastHeartbeatAt *time.Time
 	SecretHash      string
+	Blocked         bool
 	Tags            json.RawMessage
 	Metadata        json.RawMessage
 	CreatedAt       time.Time
