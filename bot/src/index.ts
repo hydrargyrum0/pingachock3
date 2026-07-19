@@ -1,21 +1,22 @@
 import 'dotenv/config';
 import { Markup, Telegraf, session, type Context } from 'telegraf';
 import { settingsRepo, userRepo } from './db';
-import { apiClient, type Router } from './api-client';
+import * as apiClient from './pingachock-client';
+import type { Router } from './pingachock-client';
 
 type MySession = {
   awaitingAddUser?: boolean;
   awaitingApiUrl?: boolean;
   awaitingAdminToken?: boolean;
+  awaitingApiKey?: boolean;
   awaitingBroadcastText?: boolean;
   broadcastDraftText?: string;
   awaitingRouterName?: boolean;
-  awaitingRouterDeleteConfirm?: number | null;
-  selectedRouterId?: number;
+  awaitingRouterBlockConfirm?: string | null;
+  selectedRouterId?: string;
 
   selectedUserTelegramId?: number;
-  selectedClientId?: number;
-  awaitingClientDeleteConfirm?: boolean;
+  awaitingUserDeleteConfirm?: boolean;
 
   awaitingPingInput?: boolean;
   pingRouterIndex?: number;
@@ -107,6 +108,7 @@ function adminRootKeyboard() {
     [Markup.button.callback('Рассылка авторизованным', 'admin:broadcast')],
     [Markup.button.callback('API URL', 'admin:api_url')],
     [Markup.button.callback('admin_token', 'admin:admin_token')],
+    [Markup.button.callback('api_key', 'admin:api_key')],
     [Markup.button.callback('Роутеры', 'admin:routers')]
   ]);
 }
@@ -990,9 +992,6 @@ function startPeriodicHealthScheduler(bot: Telegraf<MyContext>) {
 
       (async () => {
         try {
-          const perUserToken = await userRepo.getToken(telegramId);
-          if (!perUserToken) return;
-
           const executedAt = new Date();
           const sections: Array<{ name: string; lines: string[] }> = [];
 
@@ -1014,10 +1013,7 @@ function startPeriodicHealthScheduler(bot: Telegraf<MyContext>) {
               const results: any[] = [];
               for (const batch of batches) {
                 const ip_pool = batch.join(',');
-                const data = await apiClient.ping(
-                  { ip_pool, router_name: routerName, check_ports: portsOpt.value },
-                  perUserToken
-                );
+                const data = await apiClient.ping({ ip_pool, router_name: routerName, check_ports: portsOpt.value });
                 if (data && typeof data === 'object' && Array.isArray((data as any).results)) {
                   results.push(...(data as any).results);
                 }
@@ -1074,10 +1070,7 @@ function startPeriodicHealthScheduler(bot: Telegraf<MyContext>) {
                 const results: any[] = [];
                 for (const batch of params.targetsBatches) {
                   const ip_pool = batch.join(',');
-                  const data = await apiClient.ping(
-                    { ip_pool, router_name: params.routerName, check_ports: portsOpt.value },
-                    perUserToken
-                  );
+                  const data = await apiClient.ping({ ip_pool, router_name: params.routerName, check_ports: portsOpt.value });
                   if (data && typeof data === 'object' && Array.isArray((data as any).results)) {
                     const batchResults = (data as any).results;
                     if (params.targetKind === 'host') {
@@ -1272,12 +1265,12 @@ function usersListKeyboard(userIds: number[]) {
 
 function userActionsKeyboard(telegramId: number) {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🗑 Удалить клиента', `admin:delete:${telegramId}`)],
+    [Markup.button.callback('🗑 Удалить пользователя', `admin:delete:${telegramId}`)],
     [Markup.button.callback('◀️ Назад', 'admin:cancel')]
   ]);
 }
 
-function clientDeleteConfirmKeyboard() {
+function userDeleteConfirmKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('✓ Да, удалить', 'admin:delete_confirm')],
     [Markup.button.callback('◀️ Назад', 'admin:cancel')]
@@ -1363,9 +1356,9 @@ async function showRoutersList(ctx: MyContext, header?: string) {
   }
 }
 
-function routerDetailsKeyboard(routerId: number) {
+function routerDetailsKeyboard(routerId: string) {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🗑 Удалить роутер', `admin:confirm_delete_router:${routerId}`)],
+    [Markup.button.callback('🚫 Заблокировать роутер', `admin:confirm_block_router:${routerId}`)],
     [Markup.button.callback('◀️ Назад', 'admin:routers')]
   ]);
 }
@@ -1392,6 +1385,7 @@ bot.command('admin', async (ctx) => {
   ctx.session.awaitingAddUser = false;
   ctx.session.awaitingApiUrl = false;
   ctx.session.awaitingAdminToken = false;
+  ctx.session.awaitingApiKey = false;
   ctx.session.awaitingBroadcastText = false;
   ctx.session.broadcastDraftText = undefined;
   ctx.session.awaitingPingInput = false;
@@ -1403,6 +1397,7 @@ bot.action('admin:root', async (ctx) => {
   ctx.session.awaitingAddUser = false;
   ctx.session.awaitingApiUrl = false;
   ctx.session.awaitingAdminToken = false;
+  ctx.session.awaitingApiKey = false;
   ctx.session.awaitingBroadcastText = false;
   ctx.session.broadcastDraftText = undefined;
   ctx.session.awaitingPingInput = false;
@@ -1415,6 +1410,7 @@ bot.action('admin:users', async (ctx) => {
   ctx.session.awaitingAddUser = false;
   ctx.session.awaitingApiUrl = false;
   ctx.session.awaitingAdminToken = false;
+  ctx.session.awaitingApiKey = false;
   ctx.session.awaitingBroadcastText = false;
   ctx.session.broadcastDraftText = undefined;
   ctx.session.awaitingPingInput = false;
@@ -1429,6 +1425,7 @@ bot.action('admin:broadcast', async (ctx) => {
   ctx.session.awaitingAddUser = false;
   ctx.session.awaitingApiUrl = false;
   ctx.session.awaitingAdminToken = false;
+  ctx.session.awaitingApiKey = false;
   ctx.session.awaitingPingInput = false;
   ctx.session.awaitingBroadcastText = true;
   ctx.session.broadcastDraftText = undefined;
@@ -1526,13 +1523,34 @@ bot.action('admin:admin_token', async (ctx) => {
   ctx.session.awaitingAddUser = false;
   ctx.session.awaitingApiUrl = false;
   ctx.session.awaitingAdminToken = true;
+  ctx.session.awaitingApiKey = false;
   ctx.session.awaitingBroadcastText = false;
   ctx.session.broadcastDraftText = undefined;
   ctx.session.awaitingPingInput = false;
 
   await safeEditOrReply(
     ctx,
-    'Отправь admin_token одним сообщением.\n\nЧтобы отменить — нажми «Отмена».',
+    'Отправь admin_token одним сообщением.\n\nЧто это: секрет для управления узлами/аккаунтами pingachock (создание, блокировка) - тот же ADMIN_TOKEN, что и на бекенде.\n\nЧтобы отменить — нажми «Отмена».',
+    adminCancelToRootKeyboard()
+  );
+});
+
+bot.action('admin:api_key', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  await ctx.answerCbQuery();
+
+  ctx.session.awaitingAddUser = false;
+  ctx.session.awaitingApiUrl = false;
+  ctx.session.awaitingAdminToken = false;
+  ctx.session.awaitingApiKey = false;
+  ctx.session.awaitingApiKey = true;
+  ctx.session.awaitingBroadcastText = false;
+  ctx.session.broadcastDraftText = undefined;
+  ctx.session.awaitingPingInput = false;
+
+  await safeEditOrReply(
+    ctx,
+    'Отправь api_key одним сообщением.\n\nЧто это: ключ для пинга/проверок (POST /accounts/{id}/api-keys на бекенде) - один общий ключ на весь бот, не путать с admin_token.\n\nЧтобы отменить — нажми «Отмена».',
     adminCancelToRootKeyboard()
   );
 });
@@ -1542,43 +1560,20 @@ bot.action(/^admin:user:(\d+)$/, async (ctx) => {
   ctx.session.awaitingAddUser = false;
   ctx.session.awaitingApiUrl = false;
   ctx.session.awaitingAdminToken = false;
+  ctx.session.awaitingApiKey = false;
 
   const match = ctx.match as RegExpMatchArray;
   const telegramId = Number(match[1]);
 
   ctx.session.selectedUserTelegramId = telegramId;
-  ctx.session.selectedClientId = undefined;
-  ctx.session.awaitingClientDeleteConfirm = false;
+  ctx.session.awaitingUserDeleteConfirm = false;
 
   await ctx.answerCbQuery();
 
-  try {
-    const client = await apiClient.getClientByName(String(telegramId));
-    ctx.session.selectedClientId = client.id;
-
-    const createdAt = client.created_at ? String(client.created_at) : '—';
-    const blocked = typeof client.blocked === 'boolean' ? String(client.blocked) : '—';
-    const token = client.token ? String(client.token) : '';
-
-    const html =
-      `Пользователь: ${escapeHtml(String(telegramId))}\n\n` +
-      `ID: ${escapeHtml(String(client.id))}\n` +
-      `Имя: ${escapeHtml(String(client.name))}\n` +
-      `Токен: ${token ? `<code>${escapeHtml(token)}</code>` : '—'}\n` +
-      `Ограничен: ${escapeHtml(blocked)}\n` +
-      `Создан: ${escapeHtml(createdAt)}\n\n` +
-      `Выбери действие:`;
-
-    await safeEditOrReplyHtml(ctx, html, userActionsKeyboard(telegramId));
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    const html =
-      `Пользователь: ${escapeHtml(String(telegramId))}\n\n` +
-      `⚠️ Не удалось получить клиента из API:\n${escapeHtml(errMsg)}\n\n` +
-      `Выбери действие:`;
-
-    await safeEditOrReplyHtml(ctx, html, userActionsKeyboard(telegramId));
-  }
+  // No per-user entity in pingachock to fetch (see design spec section 4) -
+  // being in this list already means they have access, nothing more to show.
+  const html = `Пользователь: ${escapeHtml(String(telegramId))}\n\n` + `Доступ: разрешён\n\n` + `Выбери действие:`;
+  await safeEditOrReplyHtml(ctx, html, userActionsKeyboard(telegramId));
 });
 
 bot.action('admin:cancel', async (ctx) => {
@@ -1586,10 +1581,11 @@ bot.action('admin:cancel', async (ctx) => {
   ctx.session.awaitingAddUser = false;
   ctx.session.awaitingApiUrl = false;
   ctx.session.awaitingAdminToken = false;
+  ctx.session.awaitingApiKey = false;
   ctx.session.awaitingBroadcastText = false;
   ctx.session.broadcastDraftText = undefined;
   ctx.session.awaitingRouterName = false;
-  ctx.session.awaitingRouterDeleteConfirm = null;
+  ctx.session.awaitingRouterBlockConfirm = null;
   await ctx.answerCbQuery();
   await showUsersList(ctx);
 });
@@ -1599,31 +1595,35 @@ bot.action('admin:routers', async (ctx) => {
   ctx.session.awaitingAddUser = false;
   ctx.session.awaitingApiUrl = false;
   ctx.session.awaitingAdminToken = false;
+  ctx.session.awaitingApiKey = false;
   ctx.session.awaitingBroadcastText = false;
   ctx.session.broadcastDraftText = undefined;
   ctx.session.awaitingRouterName = false;
-  ctx.session.awaitingRouterDeleteConfirm = null;
+  ctx.session.awaitingRouterBlockConfirm = null;
   await ctx.answerCbQuery();
   await showRoutersList(ctx);
 });
 
-bot.action(/^admin:router:(\d+)$/, async (ctx) => {
+bot.action(/^admin:router:([0-9a-fA-F-]+)$/, async (ctx) => {
   if (!isAdmin(ctx)) return;
   await ctx.answerCbQuery();
 
   const match = ctx.match as RegExpMatchArray;
-  const routerId = Number(match[1]);
+  const routerId = match[1];
   ctx.session.selectedRouterId = routerId;
 
   try {
     const router = await apiClient.getRouter(routerId);
-    const lastSeen = formatRouterLastSeen((router as any).last_seen);
-    const createdAt = typeof (router as any).created_at === 'string' ? (router as any).created_at : 'нет данных';
+    const lastSeen = formatRouterLastSeen(router.last_seen);
+    const createdAt = typeof router.created_at === 'string' ? router.created_at : 'нет данных';
 
+    // No token/secret here by design - GET /nodes/{id} never returns it,
+    // only the one-time POST /nodes creation response does (see
+    // admin:add_router below).
     const html =
       `Роутер: ${escapeHtml(String(router.name))}\n` +
       `ID: ${escapeHtml(String(router.id))}\n` +
-      `Токен: <code>${escapeHtml(String(router.token))}</code>\n` +
+      `Платформа: ${escapeHtml(router.platform || '—')}\n` +
       `Статус: ${escapeHtml(String(router.status))}\n` +
       `Заблокирован: ${router.blocked ? 'true' : 'false'}\n` +
       `Последний онлайн: ${escapeHtml(String(lastSeen))}\n` +
@@ -1636,13 +1636,13 @@ bot.action(/^admin:router:(\d+)$/, async (ctx) => {
   }
 });
 
-bot.action(/^admin:confirm_delete_router:(\d+)$/, async (ctx) => {
+bot.action(/^admin:confirm_block_router:([0-9a-fA-F-]+)$/, async (ctx) => {
   if (!isAdmin(ctx)) return;
   await ctx.answerCbQuery();
 
   const match = ctx.match as RegExpMatchArray;
-  const routerId = Number(match[1]);
-  ctx.session.awaitingRouterDeleteConfirm = routerId;
+  const routerId = match[1];
+  ctx.session.awaitingRouterBlockConfirm = routerId;
 
   let routerName = 'неизвестно';
   try {
@@ -1654,28 +1654,30 @@ bot.action(/^admin:confirm_delete_router:(\d+)$/, async (ctx) => {
 
   await safeEditOrReply(
     ctx,
-    `Вы удаляете роутер ${routerName} с ID: ${routerId}\n\nДля подтверждения нажмите кнопку ниже.`,
+    `Вы блокируете роутер ${routerName} с ID: ${routerId}\n\n` +
+      `Он перестанет получать новые проверки, история сохранится.\n\n` +
+      `Для подтверждения нажмите кнопку ниже.`,
     Markup.inlineKeyboard([
-      [Markup.button.callback('✓ Да, удалить', `admin:delete_router_confirm:${routerId}`)],
+      [Markup.button.callback('✓ Да, заблокировать', `admin:block_router_confirm:${routerId}`)],
       [Markup.button.callback('◀️ Назад', 'admin:routers')]
     ])
   );
 });
 
-bot.action(/^admin:delete_router_confirm:(\d+)$/, async (ctx) => {
+bot.action(/^admin:block_router_confirm:([0-9a-fA-F-]+)$/, async (ctx) => {
   if (!isAdmin(ctx)) return;
   await ctx.answerCbQuery();
 
   const match = ctx.match as RegExpMatchArray;
-  const routerId = Number(match[1]);
+  const routerId = match[1];
 
   try {
-    await apiClient.deleteRouter(routerId);
-    ctx.session.awaitingRouterDeleteConfirm = null;
-    await showRoutersList(ctx, `Роутер ${routerId} удалён`);
+    await apiClient.blockRouter(routerId);
+    ctx.session.awaitingRouterBlockConfirm = null;
+    await showRoutersList(ctx, `Роутер ${routerId} заблокирован`);
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    await safeEditOrReply(ctx, `Ошибка удаления:\n${errMsg}`, adminCancelToRootKeyboard());
+    await safeEditOrReply(ctx, `Ошибка блокировки:\n${errMsg}`, adminCancelToRootKeyboard());
   }
 });
 
@@ -1687,6 +1689,7 @@ bot.action('admin:add_router', async (ctx) => {
   ctx.session.awaitingAddUser = false;
   ctx.session.awaitingApiUrl = false;
   ctx.session.awaitingAdminToken = false;
+  ctx.session.awaitingApiKey = false;
 
   await safeEditOrReply(
     ctx,
@@ -1700,29 +1703,16 @@ bot.action(/^admin:delete:(\d+)$/, async (ctx) => {
   ctx.session.awaitingAddUser = false;
   ctx.session.awaitingApiUrl = false;
   ctx.session.awaitingAdminToken = false;
+  ctx.session.awaitingApiKey = false;
 
   const match = ctx.match as RegExpMatchArray;
   const telegramId = Number(match[1]);
 
   ctx.session.selectedUserTelegramId = telegramId;
-  ctx.session.selectedClientId = undefined;
-  ctx.session.awaitingClientDeleteConfirm = true;
-
-  let clientIdText = '—';
-  try {
-    const client = await apiClient.getClientByName(String(telegramId));
-    ctx.session.selectedClientId = client.id;
-    clientIdText = String(client.id);
-  } catch {
-    // still allow revoking local access even if API client is missing
-  }
+  ctx.session.awaitingUserDeleteConfirm = true;
 
   await ctx.answerCbQuery();
-  await safeEditOrReply(
-    ctx,
-    `Вы удаляете клиента пользователя ${telegramId}.\nID клиента: ${clientIdText}\n\nПродолжить?`,
-    clientDeleteConfirmKeyboard()
-  );
+  await safeEditOrReply(ctx, `Вы удаляете доступ пользователя ${telegramId}.\n\nПродолжить?`, userDeleteConfirmKeyboard());
 });
 
 bot.action('admin:delete_confirm', async (ctx) => {
@@ -1734,33 +1724,14 @@ bot.action('admin:delete_confirm', async (ctx) => {
     return;
   }
 
-  const clientIdFromSession = ctx.session.selectedClientId;
-  ctx.session.awaitingClientDeleteConfirm = false;
-
+  ctx.session.awaitingUserDeleteConfirm = false;
   await ctx.answerCbQuery();
 
-  let apiDeleteError: string | null = null;
-  try {
-    let clientId = clientIdFromSession;
-    if (typeof clientId !== 'number' || !Number.isFinite(clientId)) {
-      const client = await apiClient.getClientByName(String(telegramId));
-      clientId = client.id;
-    }
-
-    if (typeof clientId === 'number' && Number.isFinite(clientId)) {
-      await apiClient.deleteClient(clientId);
-    }
-  } catch (err) {
-    apiDeleteError = err instanceof Error ? err.message : String(err);
-  }
-
+  // Purely local: no per-user entity in pingachock to clean up (see design
+  // spec section 4).
   await userRepo.deleteUser(telegramId);
 
-  const header = apiDeleteError
-    ? `Удалён пользователь: ${telegramId}\n⚠️ Ошибка удаления клиента в API: ${apiDeleteError}`
-    : `Удалён пользователь: ${telegramId}`;
-
-  await showUsersList(ctx, header);
+  await showUsersList(ctx, `Удалён пользователь: ${telegramId}`);
 });
 
 bot.action('admin:add', async (ctx) => {
@@ -1890,6 +1861,23 @@ bot.on('text', async (ctx, next) => {
     return;
   }
 
+  // Настройка api_key: только админ и только когда ждём ключ
+  if (isAdmin(ctx) && ctx.session.awaitingApiKey) {
+    const token = ctx.message.text.trim();
+
+    if (!token) {
+      await ctx.reply('Ключ не должен быть пустым.', adminCancelToRootKeyboard());
+      return;
+    }
+
+    await settingsRepo.setApiKey(token);
+    ctx.session.awaitingApiKey = false;
+
+    await ctx.reply('api_key сохранён.');
+    await ctx.reply('Админ-панель:', adminRootKeyboard());
+    return;
+  }
+
   // Добавление пользователя: только админ и только когда ждём id
   if (isAdmin(ctx) && ctx.session.awaitingAddUser) {
     const text = ctx.message.text.trim();
@@ -1903,14 +1891,14 @@ bot.on('text', async (ctx, next) => {
       return;
     }
 
-    // Create API client for this telegram user and store its token
+    // Purely local: everyone authorized shares the bot's one api_key (see
+    // design spec section 4), nothing to provision per-user in pingachock.
     try {
-      const client = await apiClient.createClient(String(telegramId));
-      await userRepo.addUser(telegramId, client.token);
+      await userRepo.addUser(telegramId);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await ctx.reply(
-        `Ошибка при создании клиента в API:\n${errMsg}`,
+        `Ошибка при добавлении пользователя:\n${errMsg}`,
         Markup.inlineKeyboard([[Markup.button.callback('◀️ Назад', 'admin:cancel')]])
       );
       return;
@@ -2137,15 +2125,6 @@ bot.on('text', async (ctx, next) => {
     const routerOpt = getPingRouterOption(ctx.session);
     const portsOpt = getPingPortsOption(ctx.session);
 
-    const fromId = ctx.from?.id;
-    const perUserToken = fromId != null ? await userRepo.getToken(fromId) : null;
-    if (!perUserToken) {
-      ctx.session.awaitingPingInput = false;
-      await ctx.reply('⚠️ Не найден client token. Обратитесь к администратору!');
-      await ctx.reply('Вы в главном меню', mainMenuKeyboard());
-      return;
-    }
-
     ctx.session.awaitingPingInput = false;
     await ctx.reply(`⏳ Выполняю ping... (${totalTargets} целей)`);
 
@@ -2155,14 +2134,7 @@ bot.on('text', async (ctx, next) => {
       const results: any[] = [];
       for (const batch of batches) {
         const ip_pool = batch.join(',');
-        const data = await apiClient.ping(
-          {
-            ip_pool,
-            router_name: routerName,
-            check_ports: portsOpt.value
-          },
-          perUserToken
-        );
+        const data = await apiClient.ping({ ip_pool, router_name: routerName, check_ports: portsOpt.value });
         if (data && typeof data === 'object' && Array.isArray((data as any).results)) {
           results.push(...(data as any).results);
         }
@@ -2581,13 +2553,6 @@ bot.action('health:force', async (ctx) => {
     return;
   }
 
-  const fromId = ctx.from?.id;
-  const perUserToken = fromId != null ? await userRepo.getToken(fromId) : null;
-  if (!perUserToken) {
-    await safeEditOrReply(ctx, '⚠️ Не найден client token. Обратитесь к администратору!', healthMenuKeyboard());
-    return;
-  }
-
   // Load routers list for ALL and for label calculations
   let routers: string[] = [];
   try {
@@ -2611,14 +2576,7 @@ bot.action('health:force', async (ctx) => {
     const results: any[] = [];
     for (const batch of batches) {
       const ip_pool = batch.join(',');
-      const data = await apiClient.ping(
-        {
-          ip_pool,
-          router_name: routerName,
-          check_ports: portsOpt.value
-        },
-        perUserToken
-      );
+      const data = await apiClient.ping({ ip_pool, router_name: routerName, check_ports: portsOpt.value });
       if (data && typeof data === 'object' && Array.isArray((data as any).results)) {
         results.push(...(data as any).results);
       }
@@ -2720,12 +2678,6 @@ bot.action('health:remna_force', async (ctx) => {
     return;
   }
 
-  const perUserToken = await userRepo.getToken(telegramId);
-  if (!perUserToken) {
-    await safeEditOrReply(ctx, '⚠️ Не найден client token. Обратитесь к администратору!', healthMenuKeyboard());
-    return;
-  }
-
   await safeEditOrReply(ctx, '⏳ Получаю список хостов из Remnawave...', healthMenuKeyboard());
 
   try {
@@ -2777,14 +2729,7 @@ bot.action('health:remna_force', async (ctx) => {
       const results: any[] = [];
       for (const batch of params.targetsBatches) {
         const ip_pool = batch.join(',');
-        const data = await apiClient.ping(
-          {
-            ip_pool,
-            router_name: params.routerName,
-            check_ports: portsOpt.value
-          },
-          perUserToken
-        );
+        const data = await apiClient.ping({ ip_pool, router_name: params.routerName, check_ports: portsOpt.value });
         if (data && typeof data === 'object' && Array.isArray((data as any).results)) {
           const batchResults = (data as any).results;
           if (params.targetKind === 'host') {
@@ -2901,12 +2846,6 @@ bot.action('health:vultr_force', async (ctx) => {
     return;
   }
 
-  const perUserToken = await userRepo.getToken(telegramId);
-  if (!perUserToken) {
-    await safeEditOrReply(ctx, '⚠️ Не найден client token. Обратитесь к администратору!', healthMenuKeyboard());
-    return;
-  }
-
   await safeEditOrReply(ctx, '⏳ Получаю список инстансов из Vultr...', healthMenuKeyboard());
 
   try {
@@ -2958,14 +2897,7 @@ bot.action('health:vultr_force', async (ctx) => {
       const results: any[] = [];
       for (const batch of batches) {
         const ip_pool = batch.join(',');
-        const data = await apiClient.ping(
-          {
-            ip_pool,
-            router_name: routerName,
-            check_ports: portsOpt.value
-          },
-          perUserToken
-        );
+        const data = await apiClient.ping({ ip_pool, router_name: routerName, check_ports: portsOpt.value });
         if (data && typeof data === 'object' && Array.isArray((data as any).results)) {
           results.push(...(data as any).results);
         }
