@@ -6,7 +6,6 @@ export type UserDoc = {
   telegram_id: number;
   has_access: boolean;
   created_at: string;
-  token?: string;
 };
 
 export type SettingDoc = {
@@ -121,32 +120,16 @@ export const userRepo = {
     return docs.map((d) => d.telegram_id);
   },
 
-  async addUser(telegramId: number, token?: string): Promise<void> {
+  async addUser(telegramId: number): Promise<void> {
     const created_at = new Date().toISOString();
     await pUpdate((cb) =>
       usersDb.update(
         { telegram_id: telegramId },
-        { $set: { telegram_id: telegramId, has_access: true, created_at, ...(token ? { token } : {}) } },
+        { $set: { telegram_id: telegramId, has_access: true, created_at } },
         { upsert: true },
         cb
       )
     );
-  },
-
-  async setToken(telegramId: number, token: string): Promise<void> {
-    await pUpdate((cb) =>
-      usersDb.update(
-        { telegram_id: telegramId },
-        { $set: { token } },
-        { upsert: false },
-        cb
-      )
-    );
-  },
-
-  async getToken(telegramId: number): Promise<string | null> {
-    const doc = await p<UserDoc | null>((cb) => usersDb.findOne({ telegram_id: telegramId }, cb));
-    return doc?.token ?? null;
   },
 
   async deleteUser(telegramId: number): Promise<void> {
@@ -191,17 +174,17 @@ export const settingsRepo = {
     );
   },
 
-  async getClientToken(): Promise<string | null> {
-    const doc = await p<SettingDoc | null>((cb) => settingsDb.findOne({ key: 'client_token' }, cb));
+  async getApiKey(): Promise<string | null> {
+    const doc = await p<SettingDoc | null>((cb) => settingsDb.findOne({ key: 'api_key' }, cb));
     return doc?.value ?? null;
   },
 
-  async setClientToken(token: string): Promise<void> {
+  async setApiKey(token: string): Promise<void> {
     const updated_at = new Date().toISOString();
     await pUpdate((cb) =>
       settingsDb.update(
-        { key: 'client_token' },
-        { $set: { key: 'client_token', value: token, updated_at } },
+        { key: 'api_key' },
+        { $set: { key: 'api_key', value: token, updated_at } },
         { upsert: true },
         cb
       )
