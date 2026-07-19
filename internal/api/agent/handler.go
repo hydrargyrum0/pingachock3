@@ -25,6 +25,7 @@ func New(s *store.Store, pollBatchLimit int) *Handler {
 
 type pollRequest struct {
 	AgentVersion string `json:"agent_version,omitempty"`
+	Platform     string `json:"platform,omitempty"`
 }
 
 type pollJob struct {
@@ -58,6 +59,9 @@ func (h *Handler) Poll(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.AgentVersion != "" {
 		_ = h.Store.SetNodeAgentVersion(r.Context(), nodeID, req.AgentVersion)
+	}
+	if req.Platform != "" {
+		_ = h.Store.SetNodePlatform(r.Context(), nodeID, req.Platform)
 	}
 
 	jobs, err := h.Store.ClaimQueuedRuns(r.Context(), nodeID, h.PollBatchLimit)

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -31,7 +32,7 @@ func NewHTTPTransport(client *http.Client, baseURL, nodeSecret, label string, lo
 func (t *HTTPTransport) Name() string { return t.label }
 
 func (t *HTTPTransport) Poll(ctx context.Context, agentVersion string) ([]Job, error) {
-	body, err := json.Marshal(map[string]string{"agent_version": agentVersion})
+	body, err := json.Marshal(map[string]string{"agent_version": agentVersion, "platform": runtime.GOOS})
 	if err != nil {
 		return nil, err
 	}
