@@ -87,6 +87,7 @@ func main() {
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireAdminToken(adminToken))
 			r.Post("/nodes", publicH.CreateNode)
+			r.Put("/nodes/{id}", publicH.UpdateNode)
 			r.Post("/accounts", publicH.CreateAccount)
 			r.Get("/accounts", publicH.ListAccounts)
 			r.Post("/accounts/{accountID}/api-keys", publicH.CreateAPIKey)
