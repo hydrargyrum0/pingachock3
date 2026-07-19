@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -65,7 +66,10 @@ func (PingChecker) Run(ctx context.Context, netCfg NetConfig, target string, raw
 
 	output := out.String()
 	sent, recv, avgMs := parsePingOutput(output)
-	success := runErr == nil && recv > 0
+	if sent == 0 {
+		sent = p.Count
+	}
+	success := runErr == nil
 
 	res := Result{
 		Success: success,
@@ -131,14 +135,23 @@ func parsePingOutput(output string) (sent, recv int, avgMs float64) {
 			v, _ := strconv.Atoi(m[1])
 			avgMs = float64(v)
 		}
-		return
+	} else {
+		if m := unixStatsRe.FindStringSubmatch(output); m != nil {
+			sent, _ = strconv.Atoi(m[1])
+			recv, _ = strconv.Atoi(m[2])
+		}
+		if m := unixAvgRe.FindStringSubmatch(output); m != nil {
+			avgMs, _ = strconv.ParseFloat(m[1], 64)
+		}
 	}
-	if m := unixStatsRe.FindStringSubmatch(output); m != nil {
-		sent, _ = strconv.Atoi(m[1])
-		recv, _ = strconv.Atoi(m[2])
-	}
-	if m := unixAvgRe.FindStringSubmatch(output); m != nil {
-		avgMs, _ = strconv.ParseFloat(m[1], 64)
+	if recv == 0 {
+		// "Sent = N, Received = N" (or its Unix equivalent) is
+		// locale-dependent text - e.g. on a Russian-locale Windows node
+		// ping.exe prints "Отправлено"/"Получено" instead, so the regexes
+		// above never match even on a fully successful run. "TTL="/"ttl="
+		// isn't translated, so fall back to counting replies by that
+		// instead of reporting a false failure.
+		recv = strings.Count(strings.ToUpper(output), "TTL=")
 	}
 	return
 }

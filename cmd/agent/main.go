@@ -322,7 +322,7 @@ func runUpdate(configPath string, svc service.Service) error {
 	if err != nil {
 		return fmt.Errorf("determine own path: %w", err)
 	}
-	dest := filepath.Join(safeInstallDir(), filepath.Base(exePath))
+	dest := installedBinaryPathIn(safeInstallDir(), exePath)
 
 	fmt.Println("Останавливаю сервис...")
 	_ = service.Control(svc, "stop") // best-effort - fine if it wasn't running
@@ -667,6 +667,47 @@ func riskyDir(dir string) bool {
 	return false
 }
 
+// installedBinaryPathIn returns the path runUpdate should overwrite: the
+// binary the OS service is actually registered to run, which lives in dir
+// (see relocateIfRisky/runSetup - the exe and agent.json always end up
+// co-located). NOT simply filepath.Base(newExePath) - the *new* update
+// source's own name - since an operator can rename their downloaded copy
+// freely (a versioned filename, a browser's "(1)" suffix on a re-download,
+// ...) with zero effect on what the service actually executes, which stays
+// whatever it was named at install time. If exactly one matching binary
+// already lives in dir, that's it (whether or not its name happens to match
+// newExePath's own); with zero or multiple candidates there's nothing safe
+// to assume, so fall back to newExePath's own name (the previous, simpler
+// behavior) rather than guessing wrong and silently updating the wrong file
+// while reporting success.
+func installedBinaryPathIn(dir, newExePath string) string {
+	newName := filepath.Base(newExePath)
+	fallback := filepath.Join(dir, newName)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fallback
+	}
+	ext := filepath.Ext(newName)
+	found := ""
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if ext != "" && !strings.EqualFold(filepath.Ext(e.Name()), ext) {
+			continue
+		}
+		if found != "" {
+			return fallback // ambiguous - more than one candidate, don't guess
+		}
+		found = e.Name()
+	}
+	if found == "" {
+		return fallback
+	}
+	return filepath.Join(dir, found)
+}
+
 // safeInstallDir is where the agent relocates itself to before installing
 // as a system service, if it finds itself in a riskyDir.
 func safeInstallDir() string {
@@ -900,7 +941,7 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 		fmt.Printf("DNS этого интерфейса: %s\n", strings.Join(dnsServers, ", "))
 	}
 	cfg.InterfaceName = selected.Name
-	cfg.LocalAddr = selected.Addrs[0].String()
+	cfg.LocalAddr = selected.PreferredAddr().String()
 	cfg.DNSServers = dnsServers
 
 	if cfg.PollIntervalSeconds <= 0 {
@@ -982,7 +1023,7 @@ func (p interfaceProbe) describe() string {
 // never blocks setup.
 func probeInterface(ifc netiface.Interface, cfg config.Config) interfaceProbe {
 	res := interfaceProbe{iface: ifc}
-	localIP := ifc.Addrs[0]
+	localIP := ifc.PreferredAddr()
 
 	direct := transport.NewDirect(localIP, cfg.DirectURL, cfg.NodeSecret, probeTimeout, nil)
 	if err := probePoll(direct); err == nil {

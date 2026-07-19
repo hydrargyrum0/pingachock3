@@ -17,6 +17,25 @@ type Interface struct {
 	IsPhysical bool
 }
 
+// PreferredAddr picks which of the interface's addresses to hand checks as
+// their source address. Prefers IPv4: net.Dialer.LocalAddr (and ping's -S)
+// must share an address family with the destination or the dial/ping fails
+// outright before a single packet goes out, and check targets are
+// overwhelmingly IPv4 - so an IPv6 address picked here would silently break
+// every IPv4 check. Falls back to the first address (typically IPv6) if the
+// interface has no IPv4 address at all.
+func (i Interface) PreferredAddr() net.IP {
+	if len(i.Addrs) == 0 {
+		return nil
+	}
+	for _, a := range i.Addrs {
+		if a.To4() != nil {
+			return a
+		}
+	}
+	return i.Addrs[0]
+}
+
 // List returns non-loopback interfaces that have at least one non-link-local
 // address, since those are the only ones useful to route checks through.
 func List() ([]Interface, error) {
