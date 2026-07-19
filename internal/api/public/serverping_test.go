@@ -3,9 +3,11 @@ package public
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -172,5 +174,59 @@ func TestServerPingInvalidPortValue(t *testing.T) {
 	}
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+// TestServerPingConcurrentRequestsDoNotCrossTalk fires several concurrent
+// requests, each asking about a *different* port, and checks each response
+// only ever contains its own request's port - never another goroutine's.
+// This is the regression test for the cross-talk bug described in
+// docs/superpowers/specs/2026-07-19-telegram-bot-merge-design.md.
+func TestServerPingConcurrentRequestsDoNotCrossTalk(t *testing.T) {
+	const n = 8
+	ports := make([]string, n)
+	closers := make([]func(), n)
+	for i := 0; i < n; i++ {
+		port, closeFn := openListener(t)
+		ports[i] = port
+		closers[i] = closeFn
+	}
+	defer func() {
+		for _, c := range closers {
+			c()
+		}
+	}()
+
+	h := &Handler{}
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, resp, err := doServerPing(h, map[string]any{
+				"targets": []string{"127.0.0.1"},
+				"ports":   []string{ports[i]},
+			})
+			if err != nil {
+				errs[i] = fmt.Errorf("goroutine %d: %w", i, err)
+				return
+			}
+			if len(resp.Results) != 1 {
+				errs[i] = fmt.Errorf("goroutine %d: got %d results, want 1", i, len(resp.Results))
+				return
+			}
+			got, ok := resp.Results[0].Ports[ports[i]]
+			if !ok || got != "open" {
+				errs[i] = fmt.Errorf("goroutine %d: requested port %s, response ports=%v - a different request's result leaked in", i, ports[i], resp.Results[0].Ports)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			t.Error(err)
+		}
 	}
 }

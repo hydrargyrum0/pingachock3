@@ -156,6 +156,85 @@ paths:
               schema: { $ref: '#/components/schemas/Node' }
         '404':
           $ref: '#/components/responses/Error'
+    put:
+      summary: Заблокировать/разблокировать узел (admin)
+      description: >
+        Исключает узел из диспетчеризации новых проверок без удаления - история
+        (checks/check_runs) сохраняется. См. internal/dispatch.
+      security:
+        - AdminAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [blocked]
+              properties:
+                blocked: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /api/v1/server-ping:
+    post:
+      summary: Пинг напрямую с бекенда (без узла)
+      description: >
+        ICMP и/или TCP-порты выполняются прямо на сервере, синхронно - результат
+        приходит в этом же ответе, без диспетчеризации на узел. Не создаёт checks
+        /check_runs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targets]
+              properties:
+                targets:
+                  type: array
+                  items: { type: string }
+                  maxItems: 50
+                ports:
+                  type: array
+                  description: '"icmp" и/или номера портов строками. По умолчанию ["icmp"].'
+                  items: { type: string }
+      responses:
+        '200':
+          description: Результаты по каждой цели
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        target: { type: string }
+                        resolved_ip: { type: string }
+                        icmp:
+                          type: object
+                          properties:
+                            success: { type: boolean }
+                            latency_ms: { type: integer }
+                            error: { type: string }
+                        ports:
+                          type: object
+                          additionalProperties: { type: string }
+        '400':
+          $ref: '#/components/responses/Error'
 
   /api/v1/accounts:
     post:
@@ -439,7 +518,9 @@ components:
         city: { type: string }
         country: { type: string }
         agent_version: { type: string }
+        platform: { type: string }
         online: { type: boolean }
+        blocked: { type: boolean }
         last_seen_at: { type: string, format: date-time, nullable: true }
         tags: { type: array, items: { type: string } }
         created_at: { type: string, format: date-time }
