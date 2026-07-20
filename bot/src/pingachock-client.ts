@@ -166,7 +166,14 @@ async function serverPing(targets: string[], icmp: boolean, ports: string[]): Pr
 }
 
 const NODE_POLL_INTERVAL_MS = 2000;
-const NODE_POLL_TIMEOUT_MS = 90000;
+// Deliberately below telegraf's handlerTimeout (120_000ms, see index.ts) -
+// must always resolve (even if just "gave up, here's what we have") before
+// telegraf's own watchdog could fire. A real incident: this used to be
+// 90_000ms, exactly telegraf's *default* handlerTimeout, and colliding with
+// it crashed the whole bot for every user over one slow ping (telegraf's
+// default error handler re-throws - see the bot.catch() comment in
+// index.ts). See docs/superpowers/specs/2026-07-19-telegram-bot-merge-design.md.
+const NODE_POLL_TIMEOUT_MS = 60000;
 
 type CheckSpec = { kind: 'icmp' } | { kind: 'port'; port: string };
 

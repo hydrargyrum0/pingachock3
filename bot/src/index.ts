@@ -77,7 +77,12 @@ function parseAdminIds(raw: string): Set<string> {
 
 const ADMIN_IDS = parseAdminIds(ADMIN_CHAT_IDS_RAW);
 
-const bot = new Telegraf<MyContext>(BOT_TOKEN);
+// handlerTimeout default is 90_000ms (telegraf's own default) - raised with
+// headroom above pingachock-client's NODE_POLL_TIMEOUT_MS (60_000ms, see
+// pingachock-client.ts) so a legitimately slow node-routed ping always
+// resolves through our own code path (and gets reported to the user via the
+// normal try/catch) well before telegraf's watchdog could ever fire.
+const bot = new Telegraf<MyContext>(BOT_TOKEN, { handlerTimeout: 120_000 });
 
 const TELEGRAM_SAFE_TEXT_LIMIT = 3072;
 
@@ -3056,12 +3061,29 @@ bot.action('ping:toggle_ports', async (ctx) => {
   );
 });
 
+// Telegraf's default error handler logs and then RE-THROWS - that exception
+// propagates out of the per-update handler, through the polling loop, and
+// crashes bot.launch() itself, killing the *entire* bot for *every* user
+// over one bad update (real incident: a single slow ping request hit
+// telegraf's own 90s handlerTimeout and took the whole bot down silently -
+// see docs/superpowers/specs/2026-07-19-telegram-bot-merge-design.md history).
+// Overriding it to not re-throw is what actually isolates one user's error
+// from everyone else - this is the fix, not just the timeout tuning below.
+bot.catch((err, ctx) => {
+  console.error('Unhandled error while processing update', ctx.update.update_id, err);
+});
+
 startPeriodicHealthScheduler(bot);
 
 bot.launch().catch((err) => {
   // Most common: 409 Conflict when another instance is already polling getUpdates
   console.error('Bot launch failed:', err);
-  process.exitCode = 1;
+  // Exit for real (not just exitCode) so `restart: unless-stopped` in
+  // docker-compose actually gets a chance to restart a fresh process -
+  // otherwise the periodic health scheduler's setInterval keeps the event
+  // loop alive forever with polling dead, a silent zombie that never
+  // recovers on its own.
+  process.exit(1);
 });
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
