@@ -38,6 +38,7 @@ var registry = map[string]Checker{
 	"tcp":  TCPChecker{},
 	"http": HTTPChecker{},
 	"dns":  DNSChecker{},
+	"tls":  TLSChecker{},
 }
 
 func Get(checkType string) (Checker, bool) {
