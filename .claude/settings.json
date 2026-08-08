@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude --version)",
+      "Read(//c/Users/hydra/.claude/**)",
+      "Read(//c/Users/hydra/.claude/skills/**)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(sh scripts/build-agent.sh)"
+    ]
+  }
+}
