@@ -6,7 +6,23 @@
       "Read(//c/Users/hydra/.claude/skills/**)",
       "WebSearch",
       "WebFetch(domain:github.com)",
-      "Bash(sh scripts/build-agent.sh)"
+      "Bash(sh scripts/build-agent.sh)",
+      "Bash(git fetch *)",
+      "Bash(git rev-list *)",
+      "Bash(git pull *)",
+      "Bash(go version *)",
+      "Bash(go vet *)",
+      "Bash(go test *)",
+      "Read(//c/Program Files/Go/src/crypto/tls//**)",
+      "Bash(xargs grep -l \"ServerName\")",
+      "Bash(grep -n -B5 \"either ServerName or InsecureSkipVerify\" \"/c/Program Files/Go/src/crypto/tls/handshake_client.go\")",
+      "Read(//c/Program Files/Go/src/crypto/tls/**)",
+      "Bash(go doc *)",
+      "Bash(go env *)",
+      "Bash(grep -rn 'either ServerName or InsecureSkipVerify' __CMDSUB_OUTPUT__/src/crypto/tls/)",
+      "Bash(sed -n 1,60p __CMDSUB_OUTPUT__/src/crypto/tls/handshake_client.go)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:8080/healthz --max-time 2)",
+      "Bash(sent, 0 'received \\(100% loss that never happened\\). Now gated on whether *)"
     ]
   }
 }

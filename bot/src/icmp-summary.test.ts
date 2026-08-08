@@ -10,7 +10,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pingachock-bot-test-'));
 process.env.DB_PATH = path.join(tmpDir, 'users.db');
 process.env.SETTINGS_DB_PATH = path.join(tmpDir, 'settings.db');
 
-const { formatIcmpSummary } = require('./pingachock-client') as typeof import('./pingachock-client');
+const { formatIcmpSummary, translateCheckError } = require('./pingachock-client') as typeof import('./pingachock-client');
 
 test('all packets received shows loss count and real latency', () => {
   assert.equal(formatIcmpSummary(4, 4, 45), '4 из 4, 45 ms');
@@ -42,4 +42,27 @@ test('no sent count and no error falls back to "no reply"', () => {
 
 test('received but no latency value at all still shows the loss count', () => {
   assert.equal(formatIcmpSummary(4, 4, undefined), '4 из 4');
+});
+
+// translateCheckError: internal/checks emits stable English tokens (see
+// classifyNetError/classifyPingError in the Go backend) instead of raw
+// error text - this is where they become the Russian text bot users see.
+test('translateCheckError maps known Go classification tokens to Russian', () => {
+  assert.equal(translateCheckError('no reply'), 'нет ответа');
+  assert.equal(translateCheckError('timeout'), 'таймаут');
+  assert.equal(translateCheckError('dns resolution failed'), 'домен не резолвится');
+});
+
+test('translateCheckError passes through an unrecognized token unchanged rather than dropping it', () => {
+  assert.equal(translateCheckError('some future token'), 'some future token');
+});
+
+test('translateCheckError passes through nullish values unchanged', () => {
+  assert.equal(translateCheckError(undefined), undefined);
+  assert.equal(translateCheckError(null), undefined);
+});
+
+test('full pipeline: a raw error token comes out as friendly Russian text, never the old raw Go error', () => {
+  assert.equal(formatIcmpSummary(4, 0, null, translateCheckError('no reply')), '0 из 4 (нет ответа)');
+  assert.doesNotMatch(formatIcmpSummary(4, 0, null, translateCheckError('no reply')), /exit status/);
 });

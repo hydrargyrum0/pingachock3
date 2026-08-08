@@ -930,10 +930,6 @@ function formatPortsSuffix(label: string): string {
   return isPortsConfiguredFromLabel(label) ? ` (${label})` : '';
 }
 
-function onlyFailed(results: any[]): any[] {
-  return results.filter((r) => r && typeof r === 'object' && (r as any).status === false);
-}
-
 function buildFailuresReport(params: {
   title: string;
   executedAt: Date;
@@ -1029,7 +1025,7 @@ function startPeriodicHealthScheduler(bot: Telegraf<MyContext>) {
             if (healthCfg.router_value === '__all__') {
               const onlineRouters = (await apiClient.listRouters()).filter((r) => r.status === 'online').map((r) => r.name);
               for (const routerName of onlineRouters) {
-                const failed = onlyFailed(await runPingBatches(routerName));
+                const failed = apiClient.onlyFailed(await runPingBatches(routerName));
                 const lines = failed.map((r) => formatPingResultLine(r, { allowedPorts, allowedPortsOrder }));
                 if (lines.length) {
                   sections.push({
@@ -1040,7 +1036,7 @@ function startPeriodicHealthScheduler(bot: Telegraf<MyContext>) {
               }
             } else {
               const routerName = healthCfg.router_value || 'auto';
-              const failed = onlyFailed(await runPingBatches(routerName));
+              const failed = apiClient.onlyFailed(await runPingBatches(routerName));
               const lines = failed.map((r) => formatPingResultLine(r, { allowedPorts, allowedPortsOrder }));
               if (lines.length) {
                 sections.push({ name: `${routerName} — Кастомный список${formatPortsSuffix(portsOpt.label)}`, lines });
@@ -1094,7 +1090,7 @@ function startPeriodicHealthScheduler(bot: Telegraf<MyContext>) {
                 if (routerValue === '__all__') {
                   const onlineRouters = (await apiClient.listRouters()).filter((r) => r.status === 'online').map((r) => r.name);
                   for (const routerName of onlineRouters) {
-                    const failed = onlyFailed(await runBatchedPing({ targetsBatches: batches, routerName }));
+                    const failed = apiClient.onlyFailed(await runBatchedPing({ targetsBatches: batches, routerName }));
                     const lines = failed.map((r) => formatPingResultLine(r, { allowedPorts, allowedPortsOrder }));
                     if (lines.length) {
                       sections.push({
@@ -1105,7 +1101,7 @@ function startPeriodicHealthScheduler(bot: Telegraf<MyContext>) {
                   }
                 } else {
                   const routerName = routerValue || 'auto';
-                  const failed = onlyFailed(await runBatchedPing({ targetsBatches: batches, routerName }));
+                  const failed = apiClient.onlyFailed(await runBatchedPing({ targetsBatches: batches, routerName }));
                   const lines = failed.map((r) => formatPingResultLine(r, { allowedPorts, allowedPortsOrder }));
                   if (lines.length) {
                     sections.push({
@@ -1120,7 +1116,7 @@ function startPeriodicHealthScheduler(bot: Telegraf<MyContext>) {
               if (hostTargets.length) {
                 const batches = chunkArray(hostTargets, 100);
                 const routerName = 'server';
-                const failed = onlyFailed(
+                const failed = apiClient.onlyFailed(
                   await runBatchedPing({ targetsBatches: batches, routerName, targetKind: 'host' })
                 );
                 const lines = failed.map((r) => formatPingResultLine(r, { allowedPorts, allowedPortsOrder }));
@@ -1179,6 +1175,15 @@ function pingResultIcon(r: any): string {
   return r?.status ? '✅' : '❌';
 }
 
+// formatResolvedSuffix: only show "-> resolved_ip" when it actually adds
+// information - i.e. resolution happened and returned something other than
+// the target itself. Shared by every place that renders a ping result line
+// so the "don't imply a re-resolution when it's the same IP" rule only has
+// one call site to update.
+function formatResolvedSuffix(r: any, ip: string): string {
+  return r?.resolved_ip && r.resolved_ip !== ip ? ` -> ${r.resolved_ip}` : '';
+}
+
 function formatPingResultLine(
   r: any,
   opts?: { allowedPorts?: Set<string>; allowedPortsOrder?: string[] }
@@ -1186,7 +1191,7 @@ function formatPingResultLine(
   const kindPrefix = r?.__targetKind === 'host' ? 'HOST ' : '';
   const ok = pingResultIcon(r);
   const ip = r?.ip ?? '';
-  const resolved = r?.resolved_ip && r.resolved_ip !== ip ? ` -> ${r.resolved_ip}` : '';
+  const resolved = formatResolvedSuffix(r, ip);
   const icmp = r?.ICMP ? ` ICMP: ${r.ICMP}` : '';
 
   const ports: string[] = [];
@@ -1250,7 +1255,7 @@ function summarizePingResponse(data: any): string {
   if (data && typeof data === 'object' && Array.isArray(data.results)) {
     const lines = data.results.map((r: any) => {
       const ip = r.ip ?? '';
-      const resolved = r.resolved_ip && r.resolved_ip !== ip ? ` -> ${r.resolved_ip}` : '';
+      const resolved = formatResolvedSuffix(r, ip);
       const ok = pingResultIcon(r);
       const icmp = r.ICMP ? ` ICMP: ${r.ICMP}` : '';
       return `${ok} ${ip}${resolved}${icmp}`;

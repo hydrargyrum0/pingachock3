@@ -156,7 +156,7 @@ async function serverPing(targets: string[], icmp: boolean, ports: string[]): Pr
       router_name: 'server'
     };
     if (r.icmp) {
-      out.ICMP = formatIcmpSummary(r.icmp.packets_sent ?? 0, r.icmp.packets_recv ?? 0, r.icmp.latency_ms, r.icmp.error);
+      out.ICMP = formatIcmpSummary(r.icmp.packets_sent ?? 0, r.icmp.packets_recv ?? 0, r.icmp.latency_ms, translateCheckError(r.icmp.error));
     }
     for (const [port, state] of Object.entries(r.ports ?? {})) {
       out[`port_${port}`] = state;
@@ -215,10 +215,11 @@ function mergeNodeResults(
       const run = check?.runs?.find((r: any) => r.node_id === nodeId);
       const result = run?.result;
 
+      const fields = parseRawFields(result?.raw);
+
       if (spec.kind === 'icmp') {
         if (result) {
-          const counts = extractPacketCounts(result.raw);
-          out.ICMP = formatIcmpSummary(counts?.sent ?? 0, counts?.recv ?? 0, result.latency_ms, result.error_message);
+          out.ICMP = formatIcmpSummary(fields.sent, fields.recv, result.latency_ms, translateCheckError(result.error_message));
           if (result.success) out.status = true;
         }
       } else {
@@ -227,8 +228,7 @@ function mergeNodeResults(
         if (state === 'open') out.status = true;
       }
 
-      const rawResolved = extractResolvedTarget(result?.raw);
-      if (rawResolved) out.resolved_ip = rawResolved;
+      if (fields.resolvedTarget) out.resolved_ip = fields.resolvedTarget;
     }
     out.blocked = classifyBlocked(out.ip, out.resolved_ip);
     return out;
@@ -255,6 +255,43 @@ export function classifyBlocked(target: string, resolvedIp: string): boolean {
   return isDomainTarget && isLoopbackIp(resolvedIp);
 }
 
+// CHECK_ERROR_TRANSLATIONS maps the stable, language-neutral classification
+// tokens internal/checks emits (see classifyNetError/classifyPingError in
+// internal/checks/checks.go and ping.go) to the Russian text bot users
+// actually see. The Go layer deliberately stays English/stable since it's
+// also the public API's ErrorMessage contract (internal/api/openapi.yaml)
+// - this is where that gets localized. Anything not in this table (a
+// future token, or something unexpected) falls through unchanged in
+// translateCheckError below rather than disappearing - still far better
+// than the raw Go error text ("exit status 1") this replaced, see
+// docs/superpowers/specs/2026-07-25-ping-result-classification-design.md
+// Section B item 1.
+const CHECK_ERROR_TRANSLATIONS: Record<string, string> = {
+  'no reply': 'нет ответа',
+  timeout: 'таймаут',
+  'dns resolution failed': 'домен не резолвится',
+  'ping failed': 'ошибка проверки',
+  'connection refused': 'соединение отклонено',
+  'connection failed': 'не удалось подключиться',
+  'certificate verification failed': 'ошибка проверки сертификата'
+};
+
+export function translateCheckError(message: string | null | undefined): string | undefined {
+  if (!message) return message ?? undefined;
+  return CHECK_ERROR_TRANSLATIONS[message] ?? message;
+}
+
+// onlyFailed keeps results a periodic health report should surface: a real
+// reachability failure (status === false), or a DNS-poisoning-blocked
+// target (see classifyBlocked) even when status computed true - e.g. the
+// poisoned loopback address happens to answer on the exact port being
+// checked, from the backend's own local perspective. Filtering on status
+// alone used to silently drop censorship events from the very report the
+// 🚫 icon (see index.ts's pingResultIcon) was built to surface.
+export function onlyFailed(results: any[]): any[] {
+  return results.filter((r) => r && typeof r === 'object' && ((r as any).status === false || (r as any).blocked === true));
+}
+
 // formatIcmpSummary is the "3 из 4" packet-loss display, plus the real
 // average latency of just the packets that actually came back (not the
 // wall-clock time of the whole multi-packet run - see
@@ -273,29 +310,24 @@ export function formatIcmpSummary(sent: number, recv: number, latencyMs: number 
   return errorMessage || 'no reply';
 }
 
-// extractPacketCounts reads packets_sent/packets_recv out of a ping check's
-// Raw JSON (see internal/checks/ping.go) - mirrors extractResolvedTarget
-// below.
-function extractPacketCounts(raw: unknown): { sent: number; recv: number } | null {
-  if (!raw) return null;
+// parseRawFields reads the subset of a check_run's Raw JSON (see
+// internal/checks/ping.go and tcp.go) mergeNodeResults cares about, in one
+// parse - it used to JSON.parse the exact same raw string twice (once each
+// for packet counts and resolved_target), mirroring the mistake
+// internal/api/public/serverping.go's own pingRawFields/parsePingRaw was
+// introduced specifically to avoid on the Go side.
+function parseRawFields(raw: unknown): { sent: number; recv: number; resolvedTarget: string | null } {
+  const empty = { sent: 0, recv: 0, resolvedTarget: null };
+  if (!raw) return empty;
   try {
     const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    if (typeof parsed?.packets_sent === 'number' && typeof parsed?.packets_recv === 'number') {
-      return { sent: parsed.packets_sent, recv: parsed.packets_recv };
-    }
-    return null;
+    return {
+      sent: typeof parsed?.packets_sent === 'number' ? parsed.packets_sent : 0,
+      recv: typeof parsed?.packets_recv === 'number' ? parsed.packets_recv : 0,
+      resolvedTarget: typeof parsed?.resolved_target === 'string' ? parsed.resolved_target : null
+    };
   } catch {
-    return null;
-  }
-}
-
-function extractResolvedTarget(raw: unknown): string | null {
-  if (!raw) return null;
-  try {
-    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    return typeof parsed?.resolved_target === 'string' ? parsed.resolved_target : null;
-  } catch {
-    return null;
+    return empty;
   }
 }
 
