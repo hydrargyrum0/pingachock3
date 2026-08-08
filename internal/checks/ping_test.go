@@ -25,7 +25,10 @@ func TestParsePingOutputWindowsEnglish(t *testing.T) {
 // process exit code 0), but its "Sent =" / "Received =" / "Average =" labels
 // come out as Russian text, so windowsStatsRe/windowsAvgRe never match and
 // recv silently stayed 0 - flipping a genuinely successful check to
-// success=false, error "no reply".
+// success=false, error "no reply". The average used to have the same bug:
+// "Average = 2ms" never matches "Среднее = 2мс", silently leaving avgMs at
+// 0 and falling through to a several-*second* wall-clock fallback for the
+// whole 4-ping run instead of a real ~2ms RTT.
 func TestParsePingOutputWindowsLocalized(t *testing.T) {
 	output := "\r\nОбмен пакетами с 1.1.1.1 по 32 байт:\r\n" +
 		"Ответ от 1.1.1.1: число байт=32 время=2мс TTL=58\r\n" +
@@ -36,9 +39,12 @@ func TestParsePingOutputWindowsLocalized(t *testing.T) {
 		"    Пакетов: отправлено = 4, получено = 4, потеряно = 0\r\n" +
 		"    (0% потерь)\r\n"
 
-	_, recv, _ := parsePingOutput(output)
+	_, recv, avg := parsePingOutput(output)
 	if recv != 4 {
 		t.Errorf("parsePingOutput() recv=%d, want 4 (should fall back to counting TTL= when labels don't match English)", recv)
+	}
+	if avg != 2 {
+		t.Errorf("parsePingOutput() avg=%v, want 2 (per-reply RTT anchored on TTL=, not the localized Average= line)", avg)
 	}
 }
 
@@ -47,8 +53,53 @@ func TestParsePingOutputNoReply(t *testing.T) {
 		"Request timed out.\r\nRequest timed out.\r\nRequest timed out.\r\nRequest timed out.\r\n\r\n" +
 		"Ping statistics for 1.1.1.1:\r\n    Packets: Sent = 4, Received = 0, Lost = 4 (100% loss),\r\n"
 
-	_, recv, _ := parsePingOutput(output)
+	_, recv, avg := parsePingOutput(output)
 	if recv != 0 {
 		t.Errorf("parsePingOutput() recv=%d, want 0 (genuine no-reply must not be miscounted via the TTL= fallback)", recv)
+	}
+	if avg != 0 {
+		t.Errorf("parsePingOutput() avg=%v, want 0 - no replies means nothing to average", avg)
+	}
+}
+
+// TestParsePingOutputWindowsPartialLossAveragesOnlyReceived: 3 of 4 replies
+// came back with different RTTs (2ms, 4ms, 6ms) - the average must be over
+// just those three (4ms), not skewed by the missing fourth packet, and recv
+// must reflect the real 3, not 4.
+func TestParsePingOutputWindowsPartialLossAveragesOnlyReceived(t *testing.T) {
+	output := "\r\nPinging 1.1.1.1 with 32 bytes of data:\r\n" +
+		"Reply from 1.1.1.1: bytes=32 time=2ms TTL=58\r\n" +
+		"Request timed out.\r\n" +
+		"Reply from 1.1.1.1: bytes=32 time=4ms TTL=58\r\n" +
+		"Reply from 1.1.1.1: bytes=32 time=6ms TTL=58\r\n\r\n" +
+		"Ping statistics for 1.1.1.1:\r\n" +
+		"    Packets: Sent = 4, Received = 3, Lost = 1 (25% loss),\r\n" +
+		"Approximate round trip times in milli-seconds:\r\n" +
+		"    Minimum = 2ms, Maximum = 6ms, Average = 4ms\r\n"
+
+	sent, recv, avg := parsePingOutput(output)
+	if sent != 4 || recv != 3 {
+		t.Errorf("parsePingOutput() sent=%d recv=%d, want sent=4 recv=3", sent, recv)
+	}
+	if avg != 4 {
+		t.Errorf("parsePingOutput() avg=%v, want 4 (average of 2, 4, 6 - the three actually-received replies)", avg)
+	}
+}
+
+// TestParsePingOutputWindowsSubMillisecond: Windows spells sub-millisecond
+// replies "time<1ms" rather than "time=Nms" - must not be dropped/miscounted.
+func TestParsePingOutputWindowsSubMillisecond(t *testing.T) {
+	output := "\r\nPinging 127.0.0.1 with 32 bytes of data:\r\n" +
+		"Reply from 127.0.0.1: bytes=32 time<1ms TTL=128\r\n" +
+		"Reply from 127.0.0.1: bytes=32 time<1ms TTL=128\r\n\r\n" +
+		"Ping statistics for 127.0.0.1:\r\n" +
+		"    Packets: Sent = 2, Received = 2, Lost = 0 (0% loss),\r\n"
+
+	sent, recv, avg := parsePingOutput(output)
+	if sent != 2 || recv != 2 {
+		t.Errorf("parsePingOutput() sent=%d recv=%d, want sent=2 recv=2", sent, recv)
+	}
+	if avg != 1 {
+		t.Errorf("parsePingOutput() avg=%v, want 1 (rounds \"<1ms\" up to the nearest whole ms)", avg)
 	}
 }

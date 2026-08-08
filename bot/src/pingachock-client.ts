@@ -156,7 +156,7 @@ async function serverPing(targets: string[], icmp: boolean, ports: string[]): Pr
       router_name: 'server'
     };
     if (r.icmp) {
-      out.ICMP = r.icmp.success ? `${r.icmp.latency_ms ?? '?'} ms` : r.icmp.error || 'no reply';
+      out.ICMP = formatIcmpSummary(r.icmp.packets_sent ?? 0, r.icmp.packets_recv ?? 0, r.icmp.latency_ms, r.icmp.error);
     }
     for (const [port, state] of Object.entries(r.ports ?? {})) {
       out[`port_${port}`] = state;
@@ -217,7 +217,8 @@ function mergeNodeResults(
 
       if (spec.kind === 'icmp') {
         if (result) {
-          out.ICMP = result.success ? `${result.latency_ms ?? '?'} ms` : result.error_message || 'no reply';
+          const counts = extractPacketCounts(result.raw);
+          out.ICMP = formatIcmpSummary(counts?.sent ?? 0, counts?.recv ?? 0, result.latency_ms, result.error_message);
           if (result.success) out.status = true;
         }
       } else {
@@ -252,6 +253,40 @@ export function classifyBlocked(target: string, resolvedIp: string): boolean {
   if (!resolvedIp) return false;
   const isDomainTarget = net.isIP(target) === 0;
   return isDomainTarget && isLoopbackIp(resolvedIp);
+}
+
+// formatIcmpSummary is the "3 из 4" packet-loss display, plus the real
+// average latency of just the packets that actually came back (not the
+// wall-clock time of the whole multi-packet run - see
+// docs/superpowers/specs/2026-07-25-ping-result-classification-design.md
+// Section B, and the matching fix in internal/checks/ping.go's
+// averageReplyTimeMs).
+export function formatIcmpSummary(sent: number, recv: number, latencyMs: number | null | undefined, errorMessage?: string): string {
+  const lossLabel = sent > 0 ? `${recv} из ${sent}` : '';
+  if (recv > 0) {
+    const latencyPart = latencyMs != null ? `, ${Math.round(latencyMs)} ms` : '';
+    return lossLabel ? `${lossLabel}${latencyPart}` : `${Math.round(latencyMs ?? 0)} ms`;
+  }
+  if (lossLabel) {
+    return errorMessage ? `${lossLabel} (${errorMessage})` : lossLabel;
+  }
+  return errorMessage || 'no reply';
+}
+
+// extractPacketCounts reads packets_sent/packets_recv out of a ping check's
+// Raw JSON (see internal/checks/ping.go) - mirrors extractResolvedTarget
+// below.
+function extractPacketCounts(raw: unknown): { sent: number; recv: number } | null {
+  if (!raw) return null;
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (typeof parsed?.packets_sent === 'number' && typeof parsed?.packets_recv === 'number') {
+      return { sent: parsed.packets_sent, recv: parsed.packets_recv };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function extractResolvedTarget(raw: unknown): string | null {

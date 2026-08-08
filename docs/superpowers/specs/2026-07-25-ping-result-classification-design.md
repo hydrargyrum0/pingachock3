@@ -5,7 +5,15 @@ Status: **Section A implemented** (`classifyBlocked` in `bot/src/pingachock-clie
 `internal/checks/ping.go` and `internal/checks/tcp.go` - it used to only
 populate when a custom per-node DNS resolver was configured, which is rare,
 so `resolved_ip` was silently empty/useless almost all the time). **Section
-B presented, awaiting confirmation.**
+B item 2 (real latency) implemented** - `averageReplyTimeMs` in
+`internal/checks/ping.go` now averages each reply's own RTT, anchored on
+`TTL=` exactly as proposed below, instead of falling back to wall-clock
+elapsed time. Also added (not originally scoped here, but the user asked
+for it directly, same conversation): packet-loss display ("3 из 4") via
+`formatIcmpSummary` in `bot/src/pingachock-client.ts`, fed by
+`packets_sent`/`packets_recv` now plumbed through `/api/v1/server-ping`'s
+response too. **Section B item 1 (error message normalization) still not
+confirmed** - raw Go error strings (`exit status 1` etc.) are unchanged.
 
 ## Problem
 

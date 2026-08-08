@@ -230,6 +230,8 @@ paths:
                             success: { type: boolean }
                             latency_ms: { type: integer }
                             error: { type: string }
+                            packets_sent: { type: integer }
+                            packets_recv: { type: integer }
                         ports:
                           type: object
                           additionalProperties: { type: string }

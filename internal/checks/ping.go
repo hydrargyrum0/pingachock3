@@ -110,7 +110,21 @@ var (
 	unixStatsRe    = regexp.MustCompile(`(\d+) packets transmitted, (\d+)( packets)? received`)
 	unixAvgRe      = regexp.MustCompile(`= [\d.]+/([\d.]+)/`)
 	windowsStatsRe = regexp.MustCompile(`Sent = (\d+), Received = (\d+)`)
-	windowsAvgRe   = regexp.MustCompile(`Average = (\d+)ms`)
+	// windowsReplyTimeRe pulls each individual reply's round-trip time by
+	// anchoring on the literal "TTL=" token, exactly like the recv fallback
+	// below - ping.exe never translates it, unlike the "time="/"Average="
+	// labels it used to depend on (Windows' "Average = Nms" summary line
+	// is display-language text: "Среднее = Nмс" on a Russian box, never
+	// matching an English-only regex). That silently left avgMs at 0 and
+	// fell through to a several-*second* wall-clock fallback (the full
+	// `ping -n 4` invocation, not one packet) on any non-English node -
+	// see docs/superpowers/specs/2026-07-25-ping-result-classification-design.md
+	// Section B. Matches "...time=2ms TTL=58" and the Cyrillic "...время=2мс
+	// TTL=58" the same way, plus Windows' "time<1ms" spelling (captures the
+	// "1"). Never matches Unix output: Unix's reply line puts "ttl=" (lower
+	// case) *before* the time, not after, so this intentionally leaves
+	// Unix's avg to unixAvgRe below.
+	windowsReplyTimeRe = regexp.MustCompile(`([\d.]+)\s*(?:ms|мс)?\s*TTL=`)
 )
 
 func parsePingOutput(output string) (sent, recv int, avgMs float64) {
@@ -128,9 +142,8 @@ func parsePingOutput(output string) (sent, recv int, avgMs float64) {
 		sent, _ = strconv.Atoi(m[1])
 		recv, _ = strconv.Atoi(m[2])
 	}
-	if m := windowsAvgRe.FindStringSubmatch(output); m != nil {
-		v, _ := strconv.Atoi(m[1])
-		avgMs = float64(v)
+	if avg := averageReplyTimeMs(output); avg > 0 {
+		avgMs = avg
 	} else if m := unixAvgRe.FindStringSubmatch(output); m != nil {
 		avgMs, _ = strconv.ParseFloat(m[1], 64)
 	}
@@ -144,4 +157,27 @@ func parsePingOutput(output string) (sent, recv int, avgMs float64) {
 		recv = strings.Count(strings.ToUpper(output), "TTL=")
 	}
 	return
+}
+
+// averageReplyTimeMs averages every reply's individual round-trip time
+// (windowsReplyTimeRe, see its comment) rather than trusting a single
+// locale-dependent summary line - also means the average reflects the
+// packets that actually came back, not whatever ping.exe's own summary
+// line otherwise says. Returns 0 when nothing matched (genuine Unix
+// output, or a run with zero replies), so the caller falls back to
+// unixAvgRe.
+func averageReplyTimeMs(output string) float64 {
+	matches := windowsReplyTimeRe.FindAllStringSubmatch(output, -1)
+	if len(matches) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, m := range matches {
+		v, err := strconv.ParseFloat(m[1], 64)
+		if err != nil {
+			continue
+		}
+		sum += v
+	}
+	return sum / float64(len(matches))
 }

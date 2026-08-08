@@ -1,9 +1,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyBlocked } from './pingachock-client';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-// Pure logic, no network/db - unlike pingachock-client.test.ts this needs
-// no live backend or env vars, so a plain `import` (not `require`) is fine.
+// Pure logic, no live backend needed - but importing pingachock-client.ts
+// eagerly imports db.ts (nedb), which writes into ./data/ relative to cwd
+// as a side effect of module load. Point it at a throwaway dir first, same
+// as pingachock-client.test.ts, so this never touches the bot's real data/
+// or races another test file over the same file. require(), not import:
+// the latter is always hoisted above the env-var setup below.
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pingachock-bot-test-'));
+process.env.DB_PATH = path.join(tmpDir, 'users.db');
+process.env.SETTINGS_DB_PATH = path.join(tmpDir, 'settings.db');
+
+const { classifyBlocked } = require('./pingachock-client') as typeof import('./pingachock-client');
 
 test('domain resolving to 127.0.0.1 is blocked', () => {
   assert.equal(classifyBlocked('fnyk.ru', '127.0.0.1'), true);

@@ -27,9 +27,11 @@ type serverPingRequest struct {
 }
 
 type serverPingICMPResult struct {
-	Success   bool   `json:"success"`
-	LatencyMs *int   `json:"latency_ms,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Success     bool   `json:"success"`
+	LatencyMs   *int   `json:"latency_ms,omitempty"`
+	Error       string `json:"error,omitempty"`
+	PacketsSent int    `json:"packets_sent"`
+	PacketsRecv int    `json:"packets_recv"`
 }
 
 type serverPingTargetResult struct {
@@ -113,14 +115,18 @@ func runServerPingTarget(ctx context.Context, target string, ports []string) ser
 			if p == "icmp" {
 				checker, _ := checks.Get("ping")
 				res := checker.Run(ctx, netCfg, target, json.RawMessage(`{"count":1,"timeout_ms":3000}`))
-				icmp := &serverPingICMPResult{Success: res.Success, LatencyMs: res.LatencyMs}
+				fields := parsePingRaw(res.Raw)
+				icmp := &serverPingICMPResult{
+					Success: res.Success, LatencyMs: res.LatencyMs,
+					PacketsSent: fields.PacketsSent, PacketsRecv: fields.PacketsRecv,
+				}
 				if !res.Success && res.ErrorMessage != nil {
 					icmp.Error = *res.ErrorMessage
 				}
 				mu.Lock()
 				out.ICMP = icmp
 				if out.ResolvedIP == "" {
-					out.ResolvedIP = resolvedIPFromRaw(res.Raw)
+					out.ResolvedIP = fields.ResolvedTarget
 				}
 				mu.Unlock()
 				return
@@ -150,7 +156,7 @@ func runServerPingTarget(ctx context.Context, target string, ports []string) ser
 			}
 			out.Ports[p] = status
 			if out.ResolvedIP == "" {
-				out.ResolvedIP = resolvedIPFromRaw(res.Raw)
+				out.ResolvedIP = parsePingRaw(res.Raw).ResolvedTarget
 			}
 			mu.Unlock()
 		}(p)
@@ -159,15 +165,22 @@ func runServerPingTarget(ctx context.Context, target string, ports []string) ser
 	return out
 }
 
-func resolvedIPFromRaw(raw json.RawMessage) string {
+// pingRawFields is the subset of internal/checks/ping.go's (and tcp.go's)
+// Raw JSON this handler cares about. TCP's Raw never has packets_sent/
+// packets_recv - json.Unmarshal just leaves those at their zero value,
+// which is fine since callers of parsePingRaw for a TCP result only ever
+// read ResolvedTarget.
+type pingRawFields struct {
+	ResolvedTarget string `json:"resolved_target"`
+	PacketsSent    int    `json:"packets_sent"`
+	PacketsRecv    int    `json:"packets_recv"`
+}
+
+func parsePingRaw(raw json.RawMessage) pingRawFields {
+	var v pingRawFields
 	if len(raw) == 0 {
-		return ""
+		return v
 	}
-	var v struct {
-		ResolvedTarget string `json:"resolved_target"`
-	}
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return ""
-	}
-	return v.ResolvedTarget
+	_ = json.Unmarshal(raw, &v)
+	return v
 }
