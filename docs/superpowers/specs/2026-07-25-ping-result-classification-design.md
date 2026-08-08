@@ -1,6 +1,11 @@
 # Ping result classification & error handling — design (WIP)
 
-Status: **Section A approved. Section B presented, awaiting confirmation.**
+Status: **Section A implemented** (`classifyBlocked` in `bot/src/pingachock-client.ts`,
+🚫 icon in `bot/src/index.ts`; resolved-IP capture made unconditional in
+`internal/checks/ping.go` and `internal/checks/tcp.go` - it used to only
+populate when a custom per-node DNS resolver was configured, which is rare,
+so `resolved_ip` was silently empty/useless almost all the time). **Section
+B presented, awaiting confirmation.**
 
 ## Problem
 

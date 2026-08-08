@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"time"
 )
 
 type Result struct {
@@ -50,6 +51,40 @@ func mustJSON(v any) json.RawMessage {
 		return json.RawMessage(`{}`)
 	}
 	return b
+}
+
+// resolveIP resolves target with resolver (falling back to the default
+// system resolver when resolver is nil - i.e. no custom interface/DNS was
+// configured), unless target is already a literal IP. probeTarget is what
+// the caller should actually connect/ping to; reportedIP is the same value
+// when a lookup happened, or "" when target was already an IP or the
+// lookup failed (nothing new to report).
+//
+// Two things this buys callers over leaving resolution to the OS ping
+// binary or net.Dialer's own internal lookup: (a) a custom resolver (e.g.
+// a VPN's DNS) actually gets used, rather than being silently ignored in
+// favor of the system resolver; (b) the caller learns which IP a domain
+// resolved to at all - needed to report it (the bot's DNS-poisoning
+// classification hinges on knowing a domain resolved to 127.0.0.1, see
+// docs/superpowers/specs/2026-07-25-ping-result-classification-design.md)
+// - and probing that exact address avoids a second, possibly different,
+// resolution happening inside ping/Dialer (round-robin DNS).
+func resolveIP(ctx context.Context, resolver *net.Resolver, target string) (probeTarget, reportedIP string) {
+	if net.ParseIP(target) != nil {
+		return target, ""
+	}
+	r := resolver
+	if r == nil {
+		r = net.DefaultResolver
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ips, err := r.LookupIPAddr(lookupCtx, target)
+	if err != nil || len(ips) == 0 {
+		return target, ""
+	}
+	ip := ips[0].String()
+	return ip, ip
 }
 
 // localAddr builds the right net.Addr type for the given network ("tcp...",

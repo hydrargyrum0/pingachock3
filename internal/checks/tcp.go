@@ -27,11 +27,21 @@ func (TCPChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 		p.TimeoutMs = 5000
 	}
 
-	addr := net.JoinHostPort(target, strconv.Itoa(p.Port))
+	// Resolve up front rather than leaving it to net.Dialer's internal
+	// lookup - same reasoning as internal/checks/ping.go's resolveIP call:
+	// makes a custom resolver actually take effect, and lets the result
+	// report which IP the domain resolved to (resolved_target below).
+	probeTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target)
+	addr := net.JoinHostPort(probeTarget, strconv.Itoa(p.Port))
 	dialer := net.Dialer{
 		Timeout:   time.Duration(p.TimeoutMs) * time.Millisecond,
 		Resolver:  netCfg.Resolver,
 		LocalAddr: localAddr("tcp", netCfg.LocalAddr),
+	}
+
+	raw := map[string]any{"address": addr}
+	if reportedIP != "" {
+		raw["resolved_target"] = reportedIP
 	}
 
 	start := time.Now()
@@ -40,8 +50,8 @@ func (TCPChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 
 	if err != nil {
 		msg := err.Error()
-		return Result{Success: false, ErrorMessage: &msg, Raw: mustJSON(map[string]any{"address": addr})}
+		return Result{Success: false, ErrorMessage: &msg, Raw: mustJSON(raw)}
 	}
 	conn.Close()
-	return Result{Success: true, LatencyMs: &elapsed, Raw: mustJSON(map[string]any{"address": addr})}
+	return Result{Success: true, LatencyMs: &elapsed, Raw: mustJSON(raw)}
 }

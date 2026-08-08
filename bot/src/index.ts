@@ -1169,14 +1169,24 @@ function startPeriodicHealthScheduler(bot: Telegraf<MyContext>) {
   }, 5000);
 }
 
+// pingResultIcon: 🚫 wins over the plain success/failure icon whenever
+// pingachock-client.ts flagged the result as DNS-poisoning-blocked (see
+// classifyBlocked there) - Turkmenistan's censorship signature, not a real
+// reachability failure, so it gets its own icon rather than looking like a
+// generic ❌.
+function pingResultIcon(r: any): string {
+  if (r?.blocked) return '🚫';
+  return r?.status ? '✅' : '❌';
+}
+
 function formatPingResultLine(
   r: any,
   opts?: { allowedPorts?: Set<string>; allowedPortsOrder?: string[] }
 ): string {
   const kindPrefix = r?.__targetKind === 'host' ? 'HOST ' : '';
-  const ok = r?.status ? '✅' : '❌';
+  const ok = pingResultIcon(r);
   const ip = r?.ip ?? '';
-  const resolved = r?.resolved_ip ? ` -> ${r.resolved_ip}` : '';
+  const resolved = r?.resolved_ip && r.resolved_ip !== ip ? ` -> ${r.resolved_ip}` : '';
   const icmp = r?.ICMP ? ` ICMP: ${r.ICMP}` : '';
 
   const ports: string[] = [];
@@ -1240,8 +1250,8 @@ function summarizePingResponse(data: any): string {
   if (data && typeof data === 'object' && Array.isArray(data.results)) {
     const lines = data.results.map((r: any) => {
       const ip = r.ip ?? '';
-      const resolved = r.resolved_ip ? ` -> ${r.resolved_ip}` : '';
-      const ok = r.status ? '✅' : '❌';
+      const resolved = r.resolved_ip && r.resolved_ip !== ip ? ` -> ${r.resolved_ip}` : '';
+      const ok = pingResultIcon(r);
       const icmp = r.ICMP ? ` ICMP: ${r.ICMP}` : '';
       return `${ok} ${ip}${resolved}${icmp}`;
     });

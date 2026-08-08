@@ -36,19 +36,7 @@ func (PingChecker) Run(ctx context.Context, netCfg NetConfig, target string, raw
 		p.TimeoutMs = 5000
 	}
 
-	// The OS ping binary does its own DNS resolution internally, using the
-	// system resolver - which defeats the point of netCfg.Resolver (e.g. a
-	// VPN's DNS silently overriding what "ping example.com" actually
-	// tests). So if a resolver is configured and target isn't already an
-	// IP, resolve it ourselves first and hand ping the address.
-	resolvedTarget := target
-	if netCfg.Resolver != nil && net.ParseIP(target) == nil {
-		lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if ips, err := netCfg.Resolver.LookupIPAddr(lookupCtx, target); err == nil && len(ips) > 0 {
-			resolvedTarget = ips[0].String()
-		}
-		cancel()
-	}
+	resolvedTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target)
 
 	overall := time.Duration(p.TimeoutMs)*time.Millisecond*time.Duration(p.Count) + 5*time.Second
 	cmdCtx, cancel := context.WithTimeout(ctx, overall)
@@ -74,7 +62,7 @@ func (PingChecker) Run(ctx context.Context, netCfg NetConfig, target string, raw
 	res := Result{
 		Success: success,
 		Raw: mustJSON(map[string]any{
-			"packets_sent": sent, "packets_recv": recv, "output": output, "resolved_target": resolvedTarget,
+			"packets_sent": sent, "packets_recv": recv, "output": output, "resolved_target": reportedIP,
 		}),
 	}
 	switch {

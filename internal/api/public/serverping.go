@@ -149,6 +149,9 @@ func runServerPingTarget(ctx context.Context, target string, ports []string) ser
 				out.Ports = make(map[string]string)
 			}
 			out.Ports[p] = status
+			if out.ResolvedIP == "" {
+				out.ResolvedIP = resolvedIPFromRaw(res.Raw)
+			}
 			mu.Unlock()
 		}(p)
 	}

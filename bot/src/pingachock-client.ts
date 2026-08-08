@@ -1,3 +1,4 @@
+import net from 'node:net';
 import { settingsRepo } from './db';
 
 export type Router = {
@@ -160,6 +161,7 @@ async function serverPing(targets: string[], icmp: boolean, ports: string[]): Pr
     for (const [port, state] of Object.entries(r.ports ?? {})) {
       out[`port_${port}`] = state;
     }
+    out.blocked = classifyBlocked(out.ip, out.resolved_ip);
     return out;
   });
   return { results };
@@ -227,8 +229,29 @@ function mergeNodeResults(
       const rawResolved = extractResolvedTarget(result?.raw);
       if (rawResolved) out.resolved_ip = rawResolved;
     }
+    out.blocked = classifyBlocked(out.ip, out.resolved_ip);
     return out;
   });
+}
+
+// isLoopbackIp matches the whole 127.0.0.0/8 block (not just 127.0.0.1) plus
+// its IPv6 equivalent - any of them is equally impossible for a real public
+// DNS record to legitimately resolve to.
+function isLoopbackIp(ip: string): boolean {
+  return ip.startsWith('127.') || ip === '::1';
+}
+
+// classifyBlocked implements Section A of
+// docs/superpowers/specs/2026-07-25-ping-result-classification-design.md:
+// a *domain* target whose DNS resolved to a loopback address is
+// Turkmenistan's DNS-poisoning signature (not a real network failure) -
+// reported as blocked regardless of whether that loopback address itself
+// answers pings. Raw IP targets are exempt: ICMP-filtered-but-TCP-open is
+// normal behavior for a bare IP and must not be misread as censorship.
+export function classifyBlocked(target: string, resolvedIp: string): boolean {
+  if (!resolvedIp) return false;
+  const isDomainTarget = net.isIP(target) === 0;
+  return isDomainTarget && isLoopbackIp(resolvedIp);
 }
 
 function extractResolvedTarget(raw: unknown): string | null {
