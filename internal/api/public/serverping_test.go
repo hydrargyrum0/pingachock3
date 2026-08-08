@@ -137,6 +137,40 @@ func TestServerPingMultipleTargetsAndPorts(t *testing.T) {
 	}
 }
 
+// TestServerPingDomainTargetResolvesOnceConsistently: a domain target with
+// both an ICMP check and a port check must report the *same* resolved_ip
+// for both - previously each check independently re-resolved the domain
+// and raced to write out.ResolvedIP, which could disagree under
+// round-robin/intermittent DNS. "localhost" resolves deterministically to
+// a loopback address via /etc/hosts (or the platform equivalent) on any
+// machine, so this doesn't depend on real network DNS.
+func TestServerPingDomainTargetResolvesOnceConsistently(t *testing.T) {
+	port, closeFn := openListener(t)
+	defer closeFn()
+
+	h := &Handler{}
+	rec, resp, err := doServerPing(h, map[string]any{
+		"targets": []string{"localhost"},
+		"ports":   []string{"icmp", port},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if len(resp.Results) != 1 {
+		t.Fatalf("results = %d, want 1", len(resp.Results))
+	}
+	got := resp.Results[0].ResolvedIP
+	if got == "" || got == "localhost" {
+		t.Fatalf("ResolvedIP = %q, want a real resolved loopback address", got)
+	}
+	if got != "127.0.0.1" && got != "::1" {
+		t.Errorf("ResolvedIP = %q, want 127.0.0.1 or ::1", got)
+	}
+}
+
 func TestServerPingEmptyTargets(t *testing.T) {
 	h := &Handler{}
 	rec, _, err := doServerPing(h, map[string]any{"targets": []string{}, "ports": []string{"80"}})

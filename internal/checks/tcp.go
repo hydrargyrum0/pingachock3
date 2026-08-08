@@ -31,7 +31,7 @@ func (TCPChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 	// lookup - same reasoning as internal/checks/ping.go's resolveIP call:
 	// makes a custom resolver actually take effect, and lets the result
 	// report which IP the domain resolved to (resolved_target below).
-	probeTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target)
+	probeTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target, time.Duration(p.TimeoutMs)*time.Millisecond, netCfg.LocalAddr)
 	addr := net.JoinHostPort(probeTarget, strconv.Itoa(p.Port))
 	dialer := net.Dialer{
 		Timeout:   time.Duration(p.TimeoutMs) * time.Millisecond,
@@ -49,7 +49,7 @@ func (TCPChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 	elapsed := int(time.Since(start).Milliseconds())
 
 	if err != nil {
-		msg := err.Error()
+		msg := classifyNetError(err)
 		return Result{Success: false, ErrorMessage: &msg, Raw: mustJSON(raw)}
 	}
 	conn.Close()

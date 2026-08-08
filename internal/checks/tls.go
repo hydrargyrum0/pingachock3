@@ -32,6 +32,10 @@ type tlsCheckParams struct {
 	// SNI at all, so strict verification would report the handshake as
 	// failed even though the real VPN client - which typically also runs
 	// with relaxed verification in exactly this setup - connects fine.
+	//
+	// Has no effect when sni ends up empty (a raw-IP target with no
+	// explicit sni) - see tlsConfigFor's doc comment for why that case
+	// always skips verification regardless of this flag.
 	AllowInsecure bool `json:"allow_insecure"`
 }
 
@@ -49,18 +53,19 @@ func (TLSChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 	if p.TimeoutMs <= 0 {
 		p.TimeoutMs = 5000
 	}
+	timeout := time.Duration(p.TimeoutMs) * time.Millisecond
 
-	probeTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target)
+	probeTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target, timeout, netCfg.LocalAddr)
 	addr := net.JoinHostPort(probeTarget, strconv.Itoa(p.Port))
 
 	sni := chooseSNI(target, p.SNI)
 
 	dialer := net.Dialer{
-		Timeout:   time.Duration(p.TimeoutMs) * time.Millisecond,
+		Timeout:   timeout,
 		LocalAddr: localAddr("tcp", netCfg.LocalAddr),
 	}
 
-	var succeeded int
+	var attempts, succeeded int
 	var totalMs int64
 	var lastErr error
 	for i := 0; i < p.Count; i++ {
@@ -70,7 +75,20 @@ func (TLSChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 			}
 			break
 		}
-		elapsed, err := tlsHandshakeOnce(ctx, &dialer, addr, sni, p.AllowInsecure)
+		attempts++
+
+		// Each attempt gets its own bounded deadline covering dial *and*
+		// handshake. dialer.Timeout above only ever bounded the TCP
+		// connect; HandshakeContext was previously handed the caller's raw
+		// ctx, which in production (internal/serveragent.Runner) has no
+		// deadline at all - a peer that accepts the TCP connection but
+		// stalls mid-handshake (a plausible censoring-middlebox behavior)
+		// would hang forever, permanently occupying one of the runner's
+		// concurrency slots. See
+		// docs/superpowers/specs/2026-07-25-ping-result-classification-design.md.
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		elapsed, err := tlsHandshakeOnce(attemptCtx, &dialer, addr, sni, p.AllowInsecure)
+		cancel()
 		if err != nil {
 			lastErr = err
 			continue
@@ -79,7 +97,7 @@ func (TLSChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 		totalMs += elapsed.Milliseconds()
 	}
 
-	raw := map[string]any{"requests_sent": p.Count, "requests_success": succeeded, "sni": sni}
+	raw := map[string]any{"requests_sent": attempts, "requests_success": succeeded, "sni": sni}
 	if reportedIP != "" {
 		raw["resolved_target"] = reportedIP
 	}
@@ -90,7 +108,7 @@ func (TLSChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 		res.LatencyMs = &v
 	}
 	if succeeded == 0 && lastErr != nil {
-		msg := lastErr.Error()
+		msg := classifyNetError(lastErr)
 		res.ErrorMessage = &msg
 	}
 	return res
@@ -112,8 +130,24 @@ func chooseSNI(target, explicitSNI string) string {
 	return ""
 }
 
+// tlsConfigFor builds the tls.Config for one handshake attempt. When sni is
+// empty (a raw-IP target with no explicit SNI - see chooseSNI), certificate
+// verification is always skipped regardless of allowInsecure: Go's
+// crypto/tls refuses to even attempt a handshake with ServerName=="" and
+// InsecureSkipVerify=false, returning "tls: either ServerName or
+// InsecureSkipVerify must be specified" before any network I/O - which used
+// to make every raw-IP TLS check fail unconditionally, the exact case this
+// checker's own doc comment claims to support. There is no meaningful
+// hostname to verify a certificate against when no SNI was sent in the
+// first place, so skipping verification here isn't a real weakening - it's
+// the only way to exercise "does a handshake complete at all" against a
+// bare IP, which is what a VPN link timing check cares about.
+func tlsConfigFor(sni string, allowInsecure bool) *tls.Config {
+	return &tls.Config{ServerName: sni, InsecureSkipVerify: allowInsecure || sni == ""}
+}
+
 // tlsHandshakeOnce dials addr and completes one TLS handshake presenting
-// sni (which may be empty - see the ServerName doc comment on why an empty
+// sni (which may be empty - see tlsConfigFor's doc comment on why an empty
 // value is a deliberate, valid choice, not a missing one). Returns how long
 // the handshake itself took, not including the TCP connect.
 func tlsHandshakeOnce(ctx context.Context, dialer *net.Dialer, addr, sni string, allowInsecure bool) (time.Duration, error) {
@@ -123,7 +157,7 @@ func tlsHandshakeOnce(ctx context.Context, dialer *net.Dialer, addr, sni string,
 	}
 	defer conn.Close()
 
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: sni, InsecureSkipVerify: allowInsecure})
+	tlsConn := tls.Client(conn, tlsConfigFor(sni, allowInsecure))
 	start := time.Now()
 	err = tlsConn.HandshakeContext(ctx)
 	elapsed := time.Since(start)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os/exec"
 	"regexp"
@@ -36,7 +37,8 @@ func (PingChecker) Run(ctx context.Context, netCfg NetConfig, target string, raw
 		p.TimeoutMs = 5000
 	}
 
-	resolvedTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target)
+	resolvedTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target, time.Duration(p.TimeoutMs)*time.Millisecond, netCfg.LocalAddr)
+	resolutionFailed := net.ParseIP(target) == nil && reportedIP == ""
 
 	overall := time.Duration(p.TimeoutMs)*time.Millisecond*time.Duration(p.Count) + 5*time.Second
 	cmdCtx, cancel := context.WithTimeout(ctx, overall)
@@ -54,7 +56,15 @@ func (PingChecker) Run(ctx context.Context, netCfg NetConfig, target string, raw
 
 	output := out.String()
 	sent, recv, avgMs := parsePingOutput(output)
-	if sent == 0 {
+	// Only trust "the stats line just didn't parse" (locale mismatch, see
+	// parsePingOutput) as a reason to assume the full p.Count actually went
+	// out. When we already know resolution itself failed - domain target,
+	// resolveIP came back empty - a run that never sent a single packet
+	// would otherwise get misreported as "p.Count sent, 0 received", i.e. a
+	// 100% loss run that never happened. See
+	// docs/superpowers/specs/2026-07-25-ping-result-classification-design.md
+	// Section B.
+	if sent == 0 && !resolutionFailed {
 		sent = p.Count
 	}
 	success := runErr == nil
@@ -73,13 +83,30 @@ func (PingChecker) Run(ctx context.Context, netCfg NetConfig, target string, raw
 		res.LatencyMs = &elapsedMs
 	}
 	if !success {
-		msg := "no reply"
-		if runErr != nil {
-			msg = runErr.Error()
-		}
+		msg := classifyPingError(cmdCtx.Err(), resolutionFailed, recv)
 		res.ErrorMessage = &msg
 	}
 	return res
+}
+
+// classifyPingError turns a shelled-out ping's exit error into a short,
+// stable classification instead of leaking the raw os/exec text (almost
+// always just "exit status 1" or "exit status 2", regardless of *why* -
+// ping's exit code alone never says whether the failure was DNS resolution,
+// a timeout, or a genuine no-reply). See
+// docs/superpowers/specs/2026-07-25-ping-result-classification-design.md
+// Section B item 1.
+func classifyPingError(cmdCtxErr error, resolutionFailed bool, recv int) string {
+	switch {
+	case errors.Is(cmdCtxErr, context.DeadlineExceeded):
+		return "timeout"
+	case resolutionFailed:
+		return "dns resolution failed"
+	case recv == 0:
+		return "no reply"
+	default:
+		return "ping failed"
+	}
 }
 
 func pingArgs(target string, count, timeoutMs int, localAddr net.IP) []string {
@@ -125,6 +152,18 @@ var (
 	// case) *before* the time, not after, so this intentionally leaves
 	// Unix's avg to unixAvgRe below.
 	windowsReplyTimeRe = regexp.MustCompile(`([\d.]+)\s*(?:ms|мс)?\s*TTL=`)
+	// windowsReplyTimeNoTTLRe covers Windows IPv6 replies, which never
+	// include a TTL= field at all (ping.exe just omits hop-limit reporting
+	// for IPv6) - e.g. "Reply from 2606:4700:4700::1111: time=15ms" with
+	// nothing after it, so windowsReplyTimeRe's TTL= anchor finds nothing.
+	// Anchored on the "Reply from"/"Ответ от" line prefix (the same
+	// bilingual pair parsePingOutput's Windows-format detection already
+	// relies on) specifically so it stays safe to try unconditionally:
+	// Unix's reply line ("64 bytes from X: icmp_seq=1 ttl=118 time=13.5
+	// ms") also contains "time=", but never "Reply from"/"Ответ от", so
+	// this can never misfire against genuine Unix output the way a bare
+	// "time=" grep would.
+	windowsReplyTimeNoTTLRe = regexp.MustCompile(`(?:Reply from|Ответ от)[^\r\n]*?(?:time|время)[=<]([\d.]+)\s*(?:ms|мс)`)
 )
 
 func parsePingOutput(output string) (sent, recv int, avgMs float64) {
@@ -142,7 +181,14 @@ func parsePingOutput(output string) (sent, recv int, avgMs float64) {
 		sent, _ = strconv.Atoi(m[1])
 		recv, _ = strconv.Atoi(m[2])
 	}
+	// Each of these three is safe to try unconditionally and in this order,
+	// regardless of locale or OS - see each regex's own doc comment for why
+	// it can't misfire against a format it isn't meant for:
+	// TTL-anchored Windows reply time, then the no-TTL Windows IPv6
+	// fallback, then Unix's summary-line average.
 	if avg := averageReplyTimeMs(output); avg > 0 {
+		avgMs = avg
+	} else if avg := averageReplyTimeMsNoTTL(output); avg > 0 {
 		avgMs = avg
 	} else if m := unixAvgRe.FindStringSubmatch(output); m != nil {
 		avgMs, _ = strconv.ParseFloat(m[1], 64)
@@ -167,7 +213,18 @@ func parsePingOutput(output string) (sent, recv int, avgMs float64) {
 // output, or a run with zero replies), so the caller falls back to
 // unixAvgRe.
 func averageReplyTimeMs(output string) float64 {
-	matches := windowsReplyTimeRe.FindAllStringSubmatch(output, -1)
+	return averageMatches(windowsReplyTimeRe.FindAllStringSubmatch(output, -1))
+}
+
+// averageReplyTimeMsNoTTL is averageReplyTimeMs's fallback for Windows IPv6
+// replies (see windowsReplyTimeNoTTLRe) - only reached once averageReplyTimeMs
+// already found nothing, i.e. either the run had zero replies or none of
+// them had a TTL= field to anchor on.
+func averageReplyTimeMsNoTTL(output string) float64 {
+	return averageMatches(windowsReplyTimeNoTTLRe.FindAllStringSubmatch(output, -1))
+}
+
+func averageMatches(matches [][]string) float64 {
 	if len(matches) == 0 {
 		return 0
 	}

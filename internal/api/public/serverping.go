@@ -96,6 +96,12 @@ func (h *Handler) ServerPing(w http.ResponseWriter, r *http.Request) {
 	api.WriteJSON(w, http.StatusOK, serverPingResponse{Results: results})
 }
 
+// serverPingDNSTimeout bounds the one-time resolution runServerPingTarget
+// does up front - deliberately generous relative to each individual check's
+// own timeout_ms (icmp uses 3s, tcp defaults to 5s) since this single
+// lookup now gates every check against the target, not just one of them.
+const serverPingDNSTimeout = 5 * time.Second
+
 // runServerPingTarget runs every requested port check (plus ICMP, if asked
 // for) against one target concurrently, and assembles them into one result.
 // mu guards the shared `out` value - the WaitGroup in ServerPing already
@@ -104,6 +110,21 @@ func (h *Handler) ServerPing(w http.ResponseWriter, r *http.Request) {
 func runServerPingTarget(ctx context.Context, target string, ports []string) serverPingTargetResult {
 	out := serverPingTargetResult{Target: target}
 	var netCfg checks.NetConfig
+
+	// Resolve once, up front, and probe that exact address for every check
+	// below - each check used to independently call resolveIP and race to
+	// report whichever answer came back first into out.ResolvedIP. Under
+	// round-robin or intermittent DNS, the ICMP check and a TCP-port check
+	// against the same target could then resolve to *different* addresses,
+	// making the reported resolved_ip - and therefore classifyBlocked's
+	// verdict on the bot side - nondeterministic between otherwise-identical
+	// requests. Passing the already-resolved literal IP as each checker's
+	// target also means their own internal resolveIP call becomes a no-op
+	// passthrough (net.ParseIP succeeds), not a second, possibly-different
+	// lookup.
+	probeTarget, reportedIP := checks.ResolveIP(ctx, nil, target, serverPingDNSTimeout)
+	out.ResolvedIP = reportedIP
+
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
@@ -114,7 +135,7 @@ func runServerPingTarget(ctx context.Context, target string, ports []string) ser
 
 			if p == "icmp" {
 				checker, _ := checks.Get("ping")
-				res := checker.Run(ctx, netCfg, target, json.RawMessage(`{"count":1,"timeout_ms":3000}`))
+				res := checker.Run(ctx, netCfg, probeTarget, json.RawMessage(`{"count":1,"timeout_ms":3000}`))
 				fields := parsePingRaw(res.Raw)
 				icmp := &serverPingICMPResult{
 					Success: res.Success, LatencyMs: res.LatencyMs,
@@ -125,9 +146,6 @@ func runServerPingTarget(ctx context.Context, target string, ports []string) ser
 				}
 				mu.Lock()
 				out.ICMP = icmp
-				if out.ResolvedIP == "" {
-					out.ResolvedIP = fields.ResolvedTarget
-				}
 				mu.Unlock()
 				return
 			}
@@ -145,7 +163,7 @@ func runServerPingTarget(ctx context.Context, target string, ports []string) ser
 				return
 			}
 			params, _ := json.Marshal(map[string]any{"port": portNum})
-			res := checker.Run(ctx, netCfg, target, params)
+			res := checker.Run(ctx, netCfg, probeTarget, params)
 			status := "closed"
 			if res.Success {
 				status = "open"
@@ -155,9 +173,6 @@ func runServerPingTarget(ctx context.Context, target string, ports []string) ser
 				out.Ports = make(map[string]string)
 			}
 			out.Ports[p] = status
-			if out.ResolvedIP == "" {
-				out.ResolvedIP = parsePingRaw(res.Raw).ResolvedTarget
-			}
 			mu.Unlock()
 		}(p)
 	}

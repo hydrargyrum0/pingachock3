@@ -1,6 +1,9 @@
 package checks
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestParsePingOutputWindowsEnglish(t *testing.T) {
 	output := "\r\nPinging 1.1.1.1 with 32 bytes of data:\r\n" +
@@ -101,5 +104,52 @@ func TestParsePingOutputWindowsSubMillisecond(t *testing.T) {
 	}
 	if avg != 1 {
 		t.Errorf("parsePingOutput() avg=%v, want 1 (rounds \"<1ms\" up to the nearest whole ms)", avg)
+	}
+}
+
+// TestParsePingOutputWindowsIPv6NoTTL: Windows never prints "TTL=" for IPv6
+// replies (ping.exe just omits hop-limit reporting), so the TTL-anchored
+// windowsReplyTimeRe alone finds nothing and averaging must fall back to
+// windowsReplyTimeNoTTLRe instead of silently returning avg=0 (which the
+// caller would then read as "fall back to several-second wall-clock time").
+func TestParsePingOutputWindowsIPv6NoTTL(t *testing.T) {
+	output := "\r\nPinging 2606:4700:4700::1111 with 32 bytes of data:\r\n" +
+		"Reply from 2606:4700:4700::1111: time=15ms\r\n" +
+		"Reply from 2606:4700:4700::1111: time=14ms\r\n" +
+		"Reply from 2606:4700:4700::1111: time=16ms\r\n" +
+		"Reply from 2606:4700:4700::1111: time=15ms\r\n\r\n" +
+		"Ping statistics for 2606:4700:4700::1111:\r\n" +
+		"    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),\r\n" +
+		"Approximate round trip times in milli-seconds:\r\n" +
+		"    Minimum = 14ms, Maximum = 16ms, Average = 15ms\r\n"
+
+	sent, recv, avg := parsePingOutput(output)
+	if sent != 4 || recv != 4 {
+		t.Errorf("parsePingOutput() sent=%d recv=%d, want sent=4 recv=4", sent, recv)
+	}
+	if avg != 15 {
+		t.Errorf("parsePingOutput() avg=%v, want 15 (real RTT average of 15,14,16,15), not 0 falling back to wall-clock time", avg)
+	}
+}
+
+func TestClassifyPingError(t *testing.T) {
+	cases := []struct {
+		name             string
+		cmdCtxErr        error
+		resolutionFailed bool
+		recv             int
+		want             string
+	}{
+		{"deadline exceeded wins over everything else", context.DeadlineExceeded, true, 0, "timeout"},
+		{"dns resolution failed", nil, true, 0, "dns resolution failed"},
+		{"no reply, resolution fine", nil, false, 0, "no reply"},
+		{"generic failure with some replies received", nil, false, 2, "ping failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyPingError(tc.cmdCtxErr, tc.resolutionFailed, tc.recv); got != tc.want {
+				t.Errorf("classifyPingError(%v, %v, %d) = %q, want %q", tc.cmdCtxErr, tc.resolutionFailed, tc.recv, got, tc.want)
+			}
+		})
 	}
 }

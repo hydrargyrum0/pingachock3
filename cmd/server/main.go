@@ -68,7 +68,7 @@ func main() {
 	log.Info("virtual server node ready", "node_id", virtualNode.ID, "name", virtualNode.Name)
 	sa := &serveragent.Runner{
 		Store: st, NodeID: virtualNode.ID, Interval: serverNodePollInterval,
-		MaxConcurrent: serverNodeMaxConcurrent, Log: log,
+		MaxConcurrent: serverNodeMaxConcurrent, PollBatchLimit: pollBatchLimit, Log: log,
 	}
 	go sa.Run(ctx)
 

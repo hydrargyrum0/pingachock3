@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"pingachock/internal/auth"
 	"pingachock/internal/checks"
@@ -28,10 +29,12 @@ import (
 const NodeName = "server"
 
 // Ensure idempotently provisions the singleton virtual "server" node - safe
-// to call on every boot. Its secret is generated but never actually used
-// for auth: unlike a real agent, the virtual node is never reached over
-// HTTP (see Runner), it's just a placeholder to satisfy nodes.secret_hash's
-// NOT NULL constraint.
+// to call on every boot, including by two backend instances booting at the
+// same time (a rolling deploy or horizontal scale-up, which
+// docs/ARCHITECTURE.md explicitly documents as needing nothing extra). Its
+// secret is generated but never actually used for auth: unlike a real
+// agent, the virtual node is never reached over HTTP (see Runner), it's
+// just a placeholder to satisfy nodes.secret_hash's NOT NULL constraint.
 func Ensure(ctx context.Context, st *store.Store) (store.Node, error) {
 	n, err := st.GetVirtualNode(ctx)
 	if err == nil {
@@ -44,7 +47,27 @@ func Ensure(ctx context.Context, st *store.Store) (store.Node, error) {
 	if err != nil {
 		return store.Node{}, fmt.Errorf("generate virtual node secret: %w", err)
 	}
-	return st.CreateVirtualNode(ctx, NodeName, auth.HashToken(secret))
+	n, err = st.CreateVirtualNode(ctx, NodeName, auth.HashToken(secret))
+	if err != nil {
+		if isUniqueViolation(err) {
+			// Lost the boot-time race: another instance's CreateVirtualNode
+			// won first (idx_nodes_one_virtual, migrations/0003). Not a
+			// real failure - read back the winner's row instead of
+			// crash-looping this instance.
+			return st.GetVirtualNode(ctx)
+		}
+		return store.Node{}, err
+	}
+	return n, nil
+}
+
+// isUniqueViolation reports whether err is Postgres' unique_violation
+// (SQLSTATE 23505) - errors.As works through however many layers
+// database/sql and the pgx stdlib driver wrap the underlying *pgconn.PgError
+// in.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 // Runner polls its own store for check_runs assigned to the virtual server
@@ -52,11 +75,32 @@ func Ensure(ctx context.Context, st *store.Store) (store.Node, error) {
 // "execute" the way a remote agent has, so the interval can be short (this
 // is what stands in for the old /api/v1/server-ping's synchronous feel).
 type Runner struct {
-	Store         *store.Store
-	NodeID        uuid.UUID
-	Interval      time.Duration
-	MaxConcurrent int
-	Log           *slog.Logger
+	Store  *store.Store
+	NodeID uuid.UUID
+	// Interval is how often tick() runs at all - this is also the floor on
+	// how promptly a queued check_run gets picked up, so it's deliberately
+	// short (see cmd/server/main.go's SERVER_NODE_POLL_INTERVAL_MS, default
+	// 1s). HeartbeatInterval below governs the much less time-sensitive
+	// heartbeat write independently.
+	Interval time.Duration
+	// HeartbeatInterval throttles how often TouchHeartbeat actually writes,
+	// separately from Interval - the node only needs to look "recently
+	// seen" within NodeOnlineThreshold (cmd/server/main.go, default 90s),
+	// so writing a heartbeat on every 1s tick was ~30-90x more DB writes
+	// than that requires. Defaults to 30s (comfortably under the default
+	// 90s threshold) when zero.
+	HeartbeatInterval time.Duration
+	MaxConcurrent     int
+	// PollBatchLimit caps how many check_runs one tick claims at once.
+	// Defaults to 50 when zero - mirrors agentapi.Handler.PollBatchLimit's
+	// own default (cmd/server/main.go's POLL_BATCH_LIMIT), which the caller
+	// is expected to pass in explicitly so the two dispatch paths (real
+	// agents vs. this virtual node) share one config knob rather than one
+	// of them silently staying hardcoded.
+	PollBatchLimit int
+	Log            *slog.Logger
+
+	lastHeartbeat time.Time
 }
 
 // Run blocks, ticking until ctx is cancelled. Every tick also touches the
@@ -82,11 +126,23 @@ func (r *Runner) Run(ctx context.Context) {
 }
 
 func (r *Runner) tick(ctx context.Context) {
-	if err := r.Store.TouchHeartbeat(ctx, r.NodeID); err != nil {
-		r.Log.Error("serveragent: touch heartbeat", "error", err)
+	heartbeatInterval := r.HeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = 30 * time.Second
+	}
+	if time.Since(r.lastHeartbeat) >= heartbeatInterval {
+		if err := r.Store.TouchHeartbeat(ctx, r.NodeID); err != nil {
+			r.Log.Error("serveragent: touch heartbeat", "error", err)
+		} else {
+			r.lastHeartbeat = time.Now()
+		}
 	}
 
-	jobs, err := r.Store.ClaimQueuedRuns(ctx, r.NodeID, 50)
+	pollBatchLimit := r.PollBatchLimit
+	if pollBatchLimit <= 0 {
+		pollBatchLimit = 50
+	}
+	jobs, err := r.Store.ClaimQueuedRuns(ctx, r.NodeID, pollBatchLimit)
 	if err != nil {
 		r.Log.Error("serveragent: claim queued runs", "error", err)
 		return
