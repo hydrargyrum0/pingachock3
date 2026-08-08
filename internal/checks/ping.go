@@ -126,23 +126,25 @@ var (
 )
 
 func parsePingOutput(output string) (sent, recv int, avgMs float64) {
-	if runtime.GOOS == "windows" {
-		if m := windowsStatsRe.FindStringSubmatch(output); m != nil {
-			sent, _ = strconv.Atoi(m[1])
-			recv, _ = strconv.Atoi(m[2])
-		}
-		if m := windowsAvgRe.FindStringSubmatch(output); m != nil {
-			v, _ := strconv.Atoi(m[1])
-			avgMs = float64(v)
-		}
-	} else {
-		if m := unixStatsRe.FindStringSubmatch(output); m != nil {
-			sent, _ = strconv.Atoi(m[1])
-			recv, _ = strconv.Atoi(m[2])
-		}
-		if m := unixAvgRe.FindStringSubmatch(output); m != nil {
-			avgMs, _ = strconv.ParseFloat(m[1], 64)
-		}
+	// Pick the regex pair by what's actually in the text, not runtime.GOOS.
+	// In production these always agree anyway (the agent only ever parses
+	// output from its own OS's ping binary), but branching on GOOS here
+	// made the Windows-format case untestable on a non-Windows dev machine
+	// or CI runner - it silently took the Unix branch and failed forever,
+	// which is exactly how a real regression in windowsStatsRe would have
+	// gone unnoticed.
+	if m := windowsStatsRe.FindStringSubmatch(output); m != nil {
+		sent, _ = strconv.Atoi(m[1])
+		recv, _ = strconv.Atoi(m[2])
+	} else if m := unixStatsRe.FindStringSubmatch(output); m != nil {
+		sent, _ = strconv.Atoi(m[1])
+		recv, _ = strconv.Atoi(m[2])
+	}
+	if m := windowsAvgRe.FindStringSubmatch(output); m != nil {
+		v, _ := strconv.Atoi(m[1])
+		avgMs = float64(v)
+	} else if m := unixAvgRe.FindStringSubmatch(output); m != nil {
+		avgMs, _ = strconv.ParseFloat(m[1], 64)
 	}
 	if recv == 0 {
 		// "Sent = N, Received = N" (or its Unix equivalent) is
