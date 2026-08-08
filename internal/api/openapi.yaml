@@ -24,6 +24,36 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateCheckRequest'
+            examples:
+              ping:
+                summary: ICMP ping, на всех доступных узлах
+                value:
+                  type: ping
+                  target: "1.1.1.1"
+                  params: { count: 4 }
+                  node_selector: { all: true }
+              tls_fronted:
+                summary: >-
+                  TLS-хендшейк на конкретный IP VPN-сервера с отдельным SNI
+                  (фронтинг через чужой домен, напр. Cloudflare) - см.
+                  internal/checks/tls.go. sni не задан = либо no-SNI (target -
+                  голый IP), либо sni=target (target - домен).
+                value:
+                  type: tls
+                  target: "203.0.113.5"
+                  params: { port: 443, sni: "cloudflare-fronted.example", count: 3, allow_insecure: true }
+                  node_selector: { node_ids: ["11111111-1111-1111-1111-111111111111"] }
+              via_server_node:
+                summary: >-
+                  Тот же запрос, выполненный самим бекендом, а не удалённым
+                  узлом - node_ids указывает на виртуальный узел "server"
+                  (GET /nodes, найти is_virtual=true). Работает для любого
+                  type, не только tcp/icmp - в отличие от /server-ping.
+                value:
+                  type: tcp
+                  target: "1.1.1.1"
+                  params: { port: 443 }
+                  node_selector: { node_ids: ["<id узла с is_virtual=true из GET /nodes>"] }
       responses:
         '201':
           description: Check создан (или батч чеков)
@@ -102,6 +132,13 @@ paths:
   /api/v1/nodes:
     get:
       summary: Список узлов
+      description: >-
+        Среди узлов всегда есть один с is_virtual=true, name="server" - это
+        сам бекенд (internal/serveragent), не реальная машина. Он всегда
+        online и его можно явно указать в node_selector.node_ids, чтобы
+        выполнить любую проверку с точки зрения бекенда, а не узла - см.
+        пример "via_server_node" в POST /checks. В node_selector с
+        all/tags он никогда не участвует (нужен явный id).
       responses:
         '200':
           description: OK
@@ -453,11 +490,6 @@ components:
           description: "см. docs/ARCHITECTURE.md - параметры зависят от type"
         node_selector: { $ref: '#/components/schemas/NodeSelector' }
         callback_url: { type: string }
-      example:
-        type: ping
-        target: "1.1.1.1"
-        params: { count: 4 }
-        node_selector: { all: true }
 
     Check:
       type: object
