@@ -35,6 +35,7 @@ type Node struct {
 	LastHeartbeatAt *time.Time
 	SecretHash      string
 	Blocked         bool
+	IsVirtual       bool
 	Tags            json.RawMessage
 	Metadata        json.RawMessage
 	CreatedAt       time.Time

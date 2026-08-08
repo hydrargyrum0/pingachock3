@@ -8,13 +8,13 @@ import (
 	"github.com/google/uuid"
 )
 
-const nodeColumns = `id, name, isp, city, country, agent_version, platform, last_heartbeat_at, secret_hash, blocked, tags, metadata, created_at`
+const nodeColumns = `id, name, isp, city, country, agent_version, platform, last_heartbeat_at, secret_hash, blocked, is_virtual, tags, metadata, created_at`
 
 func scanNode(row interface {
 	Scan(dest ...any) error
 }) (Node, error) {
 	var n Node
-	err := row.Scan(&n.ID, &n.Name, &n.ISP, &n.City, &n.Country, &n.AgentVersion, &n.Platform, &n.LastHeartbeatAt, &n.SecretHash, &n.Blocked, &n.Tags, &n.Metadata, &n.CreatedAt)
+	err := row.Scan(&n.ID, &n.Name, &n.ISP, &n.City, &n.Country, &n.AgentVersion, &n.Platform, &n.LastHeartbeatAt, &n.SecretHash, &n.Blocked, &n.IsVirtual, &n.Tags, &n.Metadata, &n.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Node{}, ErrNotFound
 	}
@@ -83,12 +83,36 @@ func scanNodes(rows *sql.Rows) ([]Node, error) {
 	var nodes []Node
 	for rows.Next() {
 		var n Node
-		if err := rows.Scan(&n.ID, &n.Name, &n.ISP, &n.City, &n.Country, &n.AgentVersion, &n.Platform, &n.LastHeartbeatAt, &n.SecretHash, &n.Blocked, &n.Tags, &n.Metadata, &n.CreatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.Name, &n.ISP, &n.City, &n.Country, &n.AgentVersion, &n.Platform, &n.LastHeartbeatAt, &n.SecretHash, &n.Blocked, &n.IsVirtual, &n.Tags, &n.Metadata, &n.CreatedAt); err != nil {
 			return nil, err
 		}
 		nodes = append(nodes, n)
 	}
 	return nodes, rows.Err()
+}
+
+// GetVirtualNode returns the singleton virtual "server" node (see
+// internal/serveragent), or ErrNotFound before it's been provisioned.
+func (s *Store) GetVirtualNode(ctx context.Context) (Node, error) {
+	return scanNode(s.DB.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM nodes WHERE is_virtual`))
+}
+
+// CreateVirtualNode provisions the singleton virtual "server" node. Callers
+// should check GetVirtualNode first (see internal/serveragent.Ensure) -
+// this doesn't check for you, though the idx_nodes_one_virtual unique index
+// (migrations/0003) makes a second call fail loudly rather than silently
+// creating a duplicate.
+func (s *Store) CreateVirtualNode(ctx context.Context, name, secretHash string) (Node, error) {
+	// country explicitly overrides the table's 'TM' default - the backend
+	// isn't physically in Turkmenistan, and this node exists precisely to
+	// measure reachability from wherever it *actually* runs (the Cloud Run
+	// control plane), not to be mistaken for a Turkmen vantage point.
+	return scanNode(s.DB.QueryRowContext(ctx,
+		`INSERT INTO nodes (name, secret_hash, platform, country, is_virtual)
+		 VALUES ($1, $2, 'server', '', true)
+		 RETURNING `+nodeColumns,
+		name, secretHash,
+	))
 }
 
 func (s *Store) TouchHeartbeat(ctx context.Context, id uuid.UUID) error {

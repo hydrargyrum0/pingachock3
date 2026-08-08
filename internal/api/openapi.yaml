@@ -523,6 +523,15 @@ components:
         platform: { type: string }
         online: { type: boolean }
         blocked: { type: boolean }
+        is_virtual:
+          type: boolean
+          description: >-
+            True only for the singleton "server" node representing the
+            backend itself - always present, always online. Lets every
+            check type run against the backend the same way it runs
+            against a real remote agent (node_selector.node_ids targeting
+            it explicitly - it's deliberately excluded from `all`/`tags`
+            selection). See internal/serveragent.
         last_seen_at: { type: string, format: date-time, nullable: true }
         tags: { type: array, items: { type: string } }
         created_at: { type: string, format: date-time }

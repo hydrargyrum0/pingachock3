@@ -18,6 +18,7 @@ import (
 	agentapi "pingachock/internal/api/agent"
 	publicapi "pingachock/internal/api/public"
 	"pingachock/internal/auth"
+	"pingachock/internal/serveragent"
 	"pingachock/internal/store"
 	"pingachock/internal/sweeper"
 )
@@ -33,6 +34,8 @@ func main() {
 	pollBatchLimit := getenvInt("POLL_BATCH_LIMIT", 50)
 	sweepInterval := time.Duration(getenvInt("SWEEP_INTERVAL_SECONDS", 30)) * time.Second
 	sweepGrace := time.Duration(getenvInt("SWEEP_GRACE_SECONDS", 600)) * time.Second
+	serverNodePollInterval := time.Duration(getenvInt("SERVER_NODE_POLL_INTERVAL_MS", 1000)) * time.Millisecond
+	serverNodeMaxConcurrent := getenvInt("SERVER_NODE_MAX_CONCURRENT", 10)
 
 	if adminToken == "" {
 		log.Warn("ADMIN_TOKEN not set - POST /api/v1/nodes will reject every request")
@@ -56,6 +59,18 @@ func main() {
 
 	sw := sweeper.New(st, sweepInterval, sweepGrace, log)
 	go sw.Run(ctx)
+
+	virtualNode, err := serveragent.Ensure(ctx, st)
+	if err != nil {
+		log.Error("provision virtual server node", "error", err)
+		os.Exit(1)
+	}
+	log.Info("virtual server node ready", "node_id", virtualNode.ID, "name", virtualNode.Name)
+	sa := &serveragent.Runner{
+		Store: st, NodeID: virtualNode.ID, Interval: serverNodePollInterval,
+		MaxConcurrent: serverNodeMaxConcurrent, Log: log,
+	}
+	go sa.Run(ctx)
 
 	publicH := publicapi.New(st, onlineThreshold)
 	agentH := agentapi.New(st, pollBatchLimit)

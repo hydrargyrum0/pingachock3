@@ -24,6 +24,7 @@ type nodeResponse struct {
 	Platform     string          `json:"platform,omitempty"`
 	Online       bool            `json:"online"`
 	Blocked      bool            `json:"blocked"`
+	IsVirtual    bool            `json:"is_virtual,omitempty"`
 	LastSeenAt   *time.Time      `json:"last_seen_at,omitempty"`
 	Tags         json.RawMessage `json:"tags"`
 	CreatedAt    time.Time       `json:"created_at"`
@@ -33,7 +34,7 @@ func toNodeResponse(n store.Node, threshold time.Duration) nodeResponse {
 	return nodeResponse{
 		ID: n.ID, Name: n.Name, ISP: n.ISP, City: n.City, Country: n.Country,
 		AgentVersion: n.AgentVersion, Platform: n.Platform, Online: n.Online(threshold), Blocked: n.Blocked,
-		LastSeenAt: n.LastHeartbeatAt, Tags: n.Tags, CreatedAt: n.CreatedAt,
+		IsVirtual: n.IsVirtual, LastSeenAt: n.LastHeartbeatAt, Tags: n.Tags, CreatedAt: n.CreatedAt,
 	}
 }
 

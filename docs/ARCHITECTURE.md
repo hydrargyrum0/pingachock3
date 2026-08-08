@@ -126,14 +126,16 @@ Auth: секрет узла (не пересекается со scope публи
 3. Узел ничего не "получает" активно — на очередном `POST /agent/poll` бекенд находит `check_runs` со своим `node_id` и статусом `queued`, помечает их `dispatched` и отдаёт узлу в ответе.
 4. Фоновый тикер переводит зависшие `queued`/`dispatched` check_runs в `timeout` по истечении грейс-периода (см. выше) — гарантирует, что `check.status` не виснет бесконечно, если узел так и не вышел на связь.
 
+**Виртуальный узел "server"** (`internal/serveragent`) — бекенд сам себе узел: строка в `nodes` с `is_virtual=true`, всегда online (heartbeat трогается каждый тик), выполняет свою очередь check_runs **в процессе**, без HTTP (напрямую `ClaimQueuedRuns`/`CompleteCheckRun`, тот же `checks.Get(type).Run(...)`, что и агент). Это значит любой тип проверки из реестра доступен через бекенд ровно тем же способом, что и через реальный узел — `node_selector.node_ids` с его id — без отдельного хардкоженного эндпоинта на каждый тип (в отличие от `/server-ping`, который остаётся как есть, только `icmp`+порты). Намеренно исключён из `all`/`tags`-селекторов (`internal/dispatch`) — попадание в выборку только явным указанием id, иначе "запустить на всех узлах" неожиданно задело бы и сам бекенд. `SKIP LOCKED` в `ClaimQueuedRuns` уже безопасен для нескольких инстансов бекенда, разбирающих одну и ту же очередь виртуального узла параллельно — горизонтальное масштабирование бекенда ничего дополнительно не требует.
+
 ### Параметры по типам проверки (`checks.params`)
 
 - `ping`: `{count, timeout_ms}`
 - `tcp`: `{port, timeout_ms}`
 - `http`: `{method, follow_redirects, timeout_ms, expect_status}`
 - `dns`: `{record_type, resolver}`
-- `tls`: `{port, verify_chain}`
-- `traceroute`: `{max_hops, timeout_ms}`
+- `tls`: `{port, sni, count, timeout_ms, allow_insecure}` — таймит TLS-хендшейк (VPN-линки на VLESS/VMess/Trojan); `sni` отвязан от `target` (тот же приём, что во `fronted.go`) для фронтинга через чужой домен на конкретный IP; `allow_insecure` пропускает верификацию сертификата - нужно, когда бэкенд отдаёт не тот сертификат, что ожидает `sni`
+- `traceroute`: пока не реализован (только enum в схеме, задел на будущее)
 
 ## Структура Go-агента
 
@@ -143,7 +145,8 @@ internal/config/        — node_id, secret, backend URLs (direct+fronted), вы
 internal/netiface/      — список сетевых интерфейсов + их DNS-сервера (per-OS: linux/darwin/windows)
 internal/transport/     — интерфейс Transport{Poll, PostResults} + direct.go, fronted.go
 internal/checks/        — интерфейс Checker{Run(ctx, netCfg, target, params) Result}
-                           + ping.go, tcp.go, http.go, dns.go, tls.go, traceroute.go
+                           + ping.go, tcp.go, http.go, dns.go, tls.go
+                           (traceroute - в enum схемы, реализации ещё нет)
 internal/poller/        — цикл опроса (джиттер, чтобы не синхронизировать все узлы),
                            воркер-пул для параллельного выполнения check_runs из одного ответа
 internal/agentlog/      — структурированный (JSON) лог в файл с ежедневной ротацией -
@@ -252,6 +255,8 @@ internal/dispatch/      — node_selector → список node_id (с учёт�
                            создание check_runs, агрегация статуса check по его check_runs
 internal/auth/          — валидация api_key и node secret (middleware)
 internal/sweeper/       — фоновый тикер: queued/dispatched check_runs старше грейс-периода → timeout
+internal/serveragent/   — виртуальный узел "server": бекенд выполняет свою же очередь check_runs
+                           в процессе (без HTTP), см. "Поток диспетчеризации" выше
 ```
 
 Бекенд полностью stateless (polling, не WebSocket) — можно поднять несколько инстансов за балансировщиком позже без sticky-сессий, когда нагрузка вырастет.

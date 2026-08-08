@@ -80,14 +80,18 @@ func Resolve(ctx context.Context, s *store.Store, sel NodeSelector, onlineThresh
 }
 
 // filterAvailable returns the IDs of nodes eligible for new dispatch: never
-// blocked, and either online or includeOffline is set. Blocked nodes are
-// excluded unconditionally here - unlike node_ids (explicit choice, gets a
-// warning), all/tags selection is "what's available right now", so a
-// blocked node just doesn't show up, same as it not existing.
+// blocked, never the virtual "server" node (see internal/serveragent), and
+// either online or includeOffline is set. Blocked nodes are excluded
+// unconditionally here - unlike node_ids (explicit choice, gets a warning),
+// all/tags selection is "what's available right now", so a blocked node
+// just doesn't show up, same as it not existing. The virtual node is
+// excluded the same way for a different reason: "run on every real node"
+// silently picking up the backend itself would be surprising - reaching it
+// is always an explicit node_ids choice.
 func filterAvailable(nodes []store.Node, includeOffline bool, threshold time.Duration) []uuid.UUID {
 	ids := make([]uuid.UUID, 0, len(nodes))
 	for _, n := range nodes {
-		if n.Blocked {
+		if n.Blocked || n.IsVirtual {
 			continue
 		}
 		if includeOffline || n.Online(threshold) {
