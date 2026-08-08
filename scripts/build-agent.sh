@@ -11,7 +11,11 @@ build() {
   os="$1"; arch="$2"; ext="$3"
   out="bin/pingachock-agent-${os}-${arch}${ext}"
   echo "building $out"
-  GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -o "$out" ./cmd/agent
+  # -p 1: one compile worker at a time. Six back-to-back cross-compiles with
+  # the default (NumCPU) parallelism has hit "paging file is too small"
+  # (out-of-virtual-memory) failures on a loaded Windows dev machine -
+  # keeping this at 1 costs a few seconds, not worth re-hitting that.
+  GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -p 1 -o "$out" ./cmd/agent
 }
 
 build linux   amd64 ""
