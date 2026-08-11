@@ -37,11 +37,12 @@ type Checker interface {
 }
 
 var registry = map[string]Checker{
-	"ping": PingChecker{},
-	"tcp":  TCPChecker{},
-	"http": HTTPChecker{},
-	"dns":  DNSChecker{},
-	"tls":  TLSChecker{},
+	"ping":    PingChecker{},
+	"tcp":     TCPChecker{},
+	"http":    HTTPChecker{},
+	"dns":     DNSChecker{},
+	"tls":     TLSChecker{},
+	"upgrade": UpgradeChecker{},
 }
 
 func Get(checkType string) (Checker, bool) {
