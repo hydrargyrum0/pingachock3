@@ -1,6 +1,6 @@
 # HTTP 101 upgrade check ("Дополнительные проверки") — design
 
-Status: APPROVED, ready for implementation planning.
+Status: DONE. Implemented per docs/superpowers/plans/2026-08-09-http-101-upgrade-check.md.
 
 ## Problem
 
