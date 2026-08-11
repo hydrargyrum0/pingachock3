@@ -373,3 +373,23 @@ export async function ping(params: { ip_pool: string; router_name?: string; chec
   const { id: nodeId, name: resolvedName } = await resolveNodeId(routerName);
   return nodePing(targets, nodeId, resolvedName, icmp, ports);
 }
+
+export type UpgradeScanResult = { target: string; matched: boolean };
+
+// mapUpgradeScanResults is split out from scanUpgrade so the response
+// mapping itself is unit-testable without a live backend - mirrors
+// toRouter's role for listRouters.
+export function mapUpgradeScanResults(data: any): UpgradeScanResult[] {
+  const results = Array.isArray(data?.results) ? data.results : [];
+  return results.map((r: any) => ({ target: String(r?.target ?? ''), matched: Boolean(r?.matched) }));
+}
+
+// scanUpgrade: HTTP 101 (websocket upgrade) check, always against the
+// backend itself (see /api/v1/server-upgrade-scan) - there is no
+// node-routed equivalent, this check only ever makes sense from the
+// server's own vantage point. See
+// docs/superpowers/specs/2026-08-09-http-101-upgrade-check-design.md.
+export async function scanUpgrade(targets: string[]): Promise<UpgradeScanResult[]> {
+  const data = await fetchWithAuth('/api/v1/server-upgrade-scan', 'POST', { targets }, 'api');
+  return mapUpgradeScanResults(data);
+}
