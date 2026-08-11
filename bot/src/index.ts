@@ -28,6 +28,8 @@ type MySession = {
   healthPortsIndex?: number;
   healthRouters?: Router[];
 
+  awaitingUpgradeScanTargets?: boolean;
+
   awaitingRemnaUrl?: boolean;
   awaitingRemnaToken?: boolean;
   awaitingRemnaIgnoreList?: boolean;
@@ -137,7 +139,15 @@ function sleep(ms: number): Promise<void> {
 function mainMenuKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🔍 Ping', 'menu:ping')],
-    [Markup.button.callback('📊 Health report', 'menu:health')]
+    [Markup.button.callback('📊 Health report', 'menu:health')],
+    [Markup.button.callback('➕ Дополнительные проверки', 'menu:extra')]
+  ]);
+}
+
+function extraChecksKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('HTTP 101 check (Websocket)', 'extra:http101')],
+    [Markup.button.callback('◀️ Назад', 'menu:root')]
   ]);
 }
 
@@ -1930,6 +1940,61 @@ bot.on('text', async (ctx, next) => {
     return;
   }
 
+  // Дополнительные проверки: HTTP 101 check — ждём список целей
+  if (ctx.session.awaitingUpgradeScanTargets && (await isAuthorizedUser(ctx))) {
+    const input = ctx.message.text.trim();
+    let parsed: { targets: string[]; expanded: boolean } | null = null;
+    try {
+      parsed = parseTargetsMultiline(input);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await ctx.reply(`Ошибка валидации целей: ${errMsg}`, extraChecksKeyboard());
+      return;
+    }
+
+    if (!parsed) {
+      await ctx.reply(
+        'Неверный формат. Пришли IPv4, подсеть (CIDR), диапазон IPv4 или домен. Каждый объект с новой строки.',
+        extraChecksKeyboard()
+      );
+      return;
+    }
+
+    if (parsed.targets.length > 100) {
+      await ctx.reply(
+        `Слишком много целей: ${parsed.targets.length}, максимум 100. Пришли список короче.`,
+        extraChecksKeyboard()
+      );
+      return;
+    }
+
+    ctx.session.awaitingUpgradeScanTargets = false;
+
+    try {
+      const results = await apiClient.scanUpgrade(parsed.targets);
+      const lines = results.map((r) => `${r.matched ? '✅' : '❌'} ${r.target}`);
+      const matchedCount = results.filter((r) => r.matched).length;
+      const reportText =
+        `HTTP 101 check (Websocket)\n` +
+        `Время проверки: ${formatHumanDate(new Date())}\n\n` +
+        `${lines.join('\n')}\n\n` +
+        `Итог: ${matchedCount} из ${results.length} отвечают условию`;
+
+      const sendAsFile = reportText.length > TELEGRAM_SAFE_TEXT_LIMIT;
+      if (sendAsFile) {
+        const filename = `http101_${safeFilenameDate(new Date())}.txt`;
+        await (ctx as any).replyWithDocument({ source: Buffer.from(reportText, 'utf8'), filename });
+        await ctx.reply('Готово.', extraChecksKeyboard());
+      } else {
+        await ctx.reply(reportText, extraChecksKeyboard());
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await ctx.reply(`Ошибка:\n${errMsg}`, extraChecksKeyboard());
+    }
+    return;
+  }
+
   // Health Report: сохранение кастомного списка (ожидаем ввод)
   if (ctx.session.awaitingHealthListInput && (await isAuthorizedUser(ctx))) {
     const telegramId = ctx.from?.id;
@@ -3007,8 +3072,27 @@ bot.command('start', async (ctx) => {
 bot.action('menu:root', async (ctx) => {
   if (!(await isAuthorizedUser(ctx))) return;
   ctx.session.awaitingPingInput = false;
+  ctx.session.awaitingUpgradeScanTargets = false;
   await ctx.answerCbQuery();
   await safeEditOrReply(ctx, await renderMainMenuText(), mainMenuKeyboard());
+});
+
+bot.action('menu:extra', async (ctx) => {
+  if (!(await isAuthorizedUser(ctx))) return;
+  await ctx.answerCbQuery();
+  ctx.session.awaitingUpgradeScanTargets = false;
+  await safeEditOrReply(ctx, 'Дополнительные проверки:', extraChecksKeyboard());
+});
+
+bot.action('extra:http101', async (ctx) => {
+  if (!(await isAuthorizedUser(ctx))) return;
+  await ctx.answerCbQuery();
+  ctx.session.awaitingUpgradeScanTargets = true;
+  await safeEditOrReply(
+    ctx,
+    'Пришли список хостов для HTTP 101 check (IPv4, CIDR, диапазон или домен, по одному на строку либо через запятую). Порт 443, протокол websocket. Максимум 100 целей.',
+    extraChecksKeyboard()
+  );
 });
 
 bot.action('menu:ping', async (ctx) => {
