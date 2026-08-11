@@ -99,6 +99,7 @@ func main() {
 			r.Get("/nodes", publicH.ListNodes)
 			r.Get("/nodes/{id}", publicH.GetNode)
 			r.Post("/server-ping", publicH.ServerPing)
+			r.Post("/server-upgrade-scan", publicH.ServerUpgradeScan)
 		})
 		r.Group(func(r chi.Router) {
 			r.Use(auth.RequireAdminToken(adminToken))
