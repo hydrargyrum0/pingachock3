@@ -805,15 +805,10 @@ function tlsHandshakeKeyboard(session: MySession) {
   ]);
 }
 
-// getUpgradeScanRouterOption/upgradeScanRouterPickerKeyboard: same router
-// list shape as VLESS/TLS Handshake's own pickers, but with an extra
-// "✅ Продолжить" confirm button - HTTP 101 check's existing target-list
-// prompt keyboard is extraChecksKeyboard(), not a router toggle, so
-// grafting the toggle directly onto that same message would silently
-// change what tapping it does mid-flow. An explicit confirm step avoids
-// that ambiguity; VLESS/TLS Handshake don't need it because their toggle
-// and their target/config prompt already live on the same message
-// throughout.
+// getUpgradeScanRouterOption/upgradeScanKeyboard: same shape and same
+// toggle-then-type flow as VLESS/TLS Handshake's own pickers (no separate
+// confirm step - the router toggle and the target-list prompt live on the
+// same message throughout, exactly like those two).
 function getUpgradeScanRouterOption(session: MySession): { label: string; value: string } {
   const routers = (session.upgradeScanRouters ?? []).filter((r) => !r.is_virtual);
   const options: Array<{ label: string; value: string }> = [
@@ -829,11 +824,10 @@ function upgradeScanRouterOptionsLen(session: MySession): number {
   return 2 + (session.upgradeScanRouters ?? []).filter((r) => !r.is_virtual).length;
 }
 
-function upgradeScanRouterPickerKeyboard(session: MySession) {
+function upgradeScanKeyboard(session: MySession) {
   const routerOpt = getUpgradeScanRouterOption(session);
   return Markup.inlineKeyboard([
     [Markup.button.callback(routerOpt.label, 'extra:upgrade_toggle_router')],
-    [Markup.button.callback('✅ Продолжить', 'extra:upgrade_confirm_router')],
     [Markup.button.callback('◀️ Назад', 'menu:root')]
   ]);
 }
@@ -2102,14 +2096,14 @@ bot.on('text', async (ctx, next) => {
       parsed = parseTargetsMultiline(input);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      await ctx.reply(`Ошибка валидации целей: ${errMsg}`, extraChecksKeyboard());
+      await ctx.reply(`Ошибка валидации целей: ${errMsg}`, upgradeScanKeyboard(ctx.session));
       return;
     }
 
     if (!parsed) {
       await ctx.reply(
         'Неверный формат. Пришли IPv4, подсеть (CIDR), диапазон IPv4 или домен. Каждый объект с новой строки.',
-        extraChecksKeyboard()
+        upgradeScanKeyboard(ctx.session)
       );
       return;
     }
@@ -2117,7 +2111,7 @@ bot.on('text', async (ctx, next) => {
     if (parsed.targets.length > 100) {
       await ctx.reply(
         `Слишком много целей: ${parsed.targets.length}, максимум 100. Пришли список короче.`,
-        extraChecksKeyboard()
+        upgradeScanKeyboard(ctx.session)
       );
       return;
     }
@@ -3246,6 +3240,9 @@ bot.action('menu:extra', async (ctx) => {
   await safeEditOrReply(ctx, 'Дополнительные проверки:', extraChecksKeyboard());
 });
 
+const UPGRADE_SCAN_PROMPT =
+  'Выбери узел (кнопка выше) и пришли список хостов для HTTP 101 check (IPv4, CIDR, диапазон или домен, по одному на строку либо через запятую). Порт 443, протокол websocket. Максимум 100 целей.';
+
 bot.action('extra:http101', async (ctx) => {
   if (!(await isAuthorizedUser(ctx))) return;
   await ctx.answerCbQuery();
@@ -3264,11 +3261,8 @@ bot.action('extra:http101', async (ctx) => {
     return;
   }
 
-  await safeEditOrReply(
-    ctx,
-    'Выбери узел (кнопка ниже), затем нажми ещё раз для подтверждения.',
-    upgradeScanRouterPickerKeyboard(ctx.session)
-  );
+  ctx.session.awaitingUpgradeScanTargets = true;
+  await safeEditOrReply(ctx, UPGRADE_SCAN_PROMPT, upgradeScanKeyboard(ctx.session));
 });
 
 bot.action('extra:upgrade_toggle_router', async (ctx) => {
@@ -3276,22 +3270,7 @@ bot.action('extra:upgrade_toggle_router', async (ctx) => {
   await ctx.answerCbQuery();
   const optionsLen = upgradeScanRouterOptionsLen(ctx.session);
   ctx.session.upgradeScanRouterIndex = ((ctx.session.upgradeScanRouterIndex ?? 0) + 1) % Math.max(1, optionsLen);
-  await safeEditOrIgnore(
-    ctx,
-    'Выбери узел (кнопка ниже), затем нажми ещё раз для подтверждения.',
-    upgradeScanRouterPickerKeyboard(ctx.session)
-  );
-});
-
-bot.action('extra:upgrade_confirm_router', async (ctx) => {
-  if (!(await isAuthorizedUser(ctx))) return;
-  await ctx.answerCbQuery();
-  ctx.session.awaitingUpgradeScanTargets = true;
-  await safeEditOrReply(
-    ctx,
-    'Пришли список хостов для HTTP 101 check (IPv4, CIDR, диапазон или домен, по одному на строку либо через запятую). Порт 443, протокол websocket. Максимум 100 целей.',
-    extraChecksKeyboard()
-  );
+  await safeEditOrIgnore(ctx, UPGRADE_SCAN_PROMPT, upgradeScanKeyboard(ctx.session));
 });
 
 bot.action('extra:vlessspeedtest', async (ctx) => {
