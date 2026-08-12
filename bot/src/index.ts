@@ -34,6 +34,10 @@ type MySession = {
   vlessRouterIndex?: number;
   vlessRouters?: Router[];
 
+  awaitingTlsHandshakeTarget?: boolean;
+  tlsHandshakeRouterIndex?: number;
+  tlsHandshakeRouters?: Router[];
+
   awaitingRemnaUrl?: boolean;
   awaitingRemnaToken?: boolean;
   awaitingRemnaIgnoreList?: boolean;
@@ -152,6 +156,7 @@ function extraChecksKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('HTTP 101 check (Websocket)', 'extra:http101')],
     [Markup.button.callback('VLESS Speedtest', 'extra:vlessspeedtest')],
+    [Markup.button.callback('TLS Handshake', 'extra:tlshandshake')],
     [Markup.button.callback('◀️ Назад', 'menu:root')]
   ]);
 }
@@ -771,6 +776,27 @@ function vlessKeyboard(session: MySession) {
   const routerOpt = getVlessRouterOption(session);
   return Markup.inlineKeyboard([
     [Markup.button.callback(routerOpt.label, 'extra:vless_toggle_router')],
+    [Markup.button.callback('◀️ Назад', 'menu:root')]
+  ]);
+}
+
+// getTlsHandshakeRouterOption/tlsHandshakeKeyboard: own independent
+// router-toggle state, no "ALL" - same reasoning as VLESS Speedtest's own
+// picker (one chosen node at a time).
+function getTlsHandshakeRouterOption(session: MySession): { label: string; value: string } {
+  const routers = session.tlsHandshakeRouters ?? [];
+  const options: Array<{ label: string; value: string }> = [
+    { label: pingRouterLabels.auto, value: 'auto' },
+    ...routers.map((r) => ({ label: r.name, value: r.name }))
+  ];
+  const index = session.tlsHandshakeRouterIndex ?? 0;
+  return options[Math.max(0, Math.min(index, options.length - 1))];
+}
+
+function tlsHandshakeKeyboard(session: MySession) {
+  const routerOpt = getTlsHandshakeRouterOption(session);
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(routerOpt.label, 'extra:tls_toggle_router')],
     [Markup.button.callback('◀️ Назад', 'menu:root')]
   ]);
 }
@@ -1968,6 +1994,34 @@ bot.on('text', async (ctx, next) => {
     return;
   }
 
+  // Дополнительные проверки: TLS Handshake — ждём "IP SNI"
+  if (ctx.session.awaitingTlsHandshakeTarget && (await isAuthorizedUser(ctx))) {
+    const input = ctx.message.text.trim();
+    const parsed = apiClient.parseTlsHandshakeTarget(input);
+    if (!parsed) {
+      await ctx.reply(
+        'Неверный формат. Пришли IP и домен (SNI) через пробел или запятую, например: 123.123.123.123 pingachock.com',
+        tlsHandshakeKeyboard(ctx.session)
+      );
+      return;
+    }
+
+    const routerOpt = getTlsHandshakeRouterOption(ctx.session);
+    ctx.session.awaitingTlsHandshakeTarget = false;
+
+    try {
+      const result = await apiClient.checkTlsHandshake(parsed.ip, parsed.sni, routerOpt.value);
+      const reportText = result.success
+        ? `TLS Handshake Check\nВремя проверки: ${formatHumanDate(new Date())}\nЦель: ${parsed.ip}:443, SNI: ${parsed.sni}\nУзел: ${routerOpt.label}\n\n✅ ${result.latencyMs != null ? result.latencyMs + ' ms' : 'успех, время не измерено'}`
+        : `TLS Handshake Check\nВремя проверки: ${formatHumanDate(new Date())}\nЦель: ${parsed.ip}:443, SNI: ${parsed.sni}\nУзел: ${routerOpt.label}\n\n❌ ошибка: ${result.errorMessage ?? 'неизвестная ошибка'}`;
+      await ctx.reply(reportText, extraChecksKeyboard());
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await ctx.reply(`Ошибка:\n${errMsg}`, extraChecksKeyboard());
+    }
+    return;
+  }
+
   // Дополнительные проверки: VLESS Speedtest — ждём конфиг
   if (ctx.session.awaitingVlessConfig && (await isAuthorizedUser(ctx))) {
     const input = ctx.message.text.trim();
@@ -3137,6 +3191,7 @@ bot.action('menu:root', async (ctx) => {
   ctx.session.awaitingPingInput = false;
   ctx.session.awaitingUpgradeScanTargets = false;
   ctx.session.awaitingVlessConfig = false;
+  ctx.session.awaitingTlsHandshakeTarget = false;
   await ctx.answerCbQuery();
   await safeEditOrReply(ctx, await renderMainMenuText(), mainMenuKeyboard());
 });
@@ -3146,6 +3201,7 @@ bot.action('menu:extra', async (ctx) => {
   await ctx.answerCbQuery();
   ctx.session.awaitingUpgradeScanTargets = false;
   ctx.session.awaitingVlessConfig = false;
+  ctx.session.awaitingTlsHandshakeTarget = false;
   await safeEditOrReply(ctx, 'Дополнительные проверки:', extraChecksKeyboard());
 });
 
@@ -3195,6 +3251,44 @@ bot.action('extra:vless_toggle_router', async (ctx) => {
     ctx,
     'Выбери узел (кнопка выше) и пришли конфиг xray-core целиком (JSON) одним сообщением.',
     vlessKeyboard(ctx.session)
+  );
+});
+
+bot.action('extra:tlshandshake', async (ctx) => {
+  if (!(await isAuthorizedUser(ctx))) return;
+  await ctx.answerCbQuery();
+
+  ctx.session.tlsHandshakeRouterIndex = ctx.session.tlsHandshakeRouterIndex ?? 0;
+  try {
+    const allRouters = await apiClient.listRouters();
+    ctx.session.tlsHandshakeRouters = allRouters.filter((r) => r.status === 'online');
+    const optionsLen = 1 + (ctx.session.tlsHandshakeRouters?.length ?? 0);
+    if (optionsLen > 0 && (ctx.session.tlsHandshakeRouterIndex ?? 0) >= optionsLen) {
+      ctx.session.tlsHandshakeRouterIndex = 0;
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    await safeEditOrReply(ctx, `Ошибка:\n${errMsg}`, extraChecksKeyboard());
+    return;
+  }
+
+  ctx.session.awaitingTlsHandshakeTarget = true;
+  await safeEditOrReply(
+    ctx,
+    'Выбери узел (кнопка выше) и пришли цель: IP и домен (SNI) через пробел, например: 123.123.123.123 pingachock.com',
+    tlsHandshakeKeyboard(ctx.session)
+  );
+});
+
+bot.action('extra:tls_toggle_router', async (ctx) => {
+  if (!(await isAuthorizedUser(ctx))) return;
+  await ctx.answerCbQuery();
+  const optionsLen = 1 + (ctx.session.tlsHandshakeRouters?.length ?? 0);
+  ctx.session.tlsHandshakeRouterIndex = ((ctx.session.tlsHandshakeRouterIndex ?? 0) + 1) % Math.max(1, optionsLen);
+  await safeEditOrIgnore(
+    ctx,
+    'Выбери узел (кнопка выше) и пришли цель: IP и домен (SNI) через пробел, например: 123.123.123.123 pingachock.com',
+    tlsHandshakeKeyboard(ctx.session)
   );
 });
 
