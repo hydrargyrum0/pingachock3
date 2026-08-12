@@ -444,3 +444,59 @@ export async function checkVlessSpeed(config: unknown, routerName: string): Prom
   const check = await pollCheckUntilDone(checkId, 90000);
   return mapVlessSpeedTestResult(check, nodeId);
 }
+
+// parseTlsHandshakeTarget: "IP SNI" (or "IP, SNI"), exactly two tokens.
+// The first must be a literal IP (net.isIP) - matches the design's own
+// scenario (dialing a relay's real IP directly), not a domain. The second
+// is the SNI, accepted as-is with no further validation - it's just a
+// hostname the caller is asserting their own relay/DNS config makes sense
+// of, this package has no way to check that.
+export function parseTlsHandshakeTarget(input: string): { ip: string; sni: string } | null {
+  const tokens = input.trim().split(/[\s,]+/).filter(Boolean);
+  if (tokens.length !== 2) return null;
+  const [ip, sni] = tokens;
+  if (net.isIP(ip) === 0) return null;
+  return { ip, sni };
+}
+
+export type TlsHandshakeResult = { success: boolean; latencyMs?: number; errorMessage?: string };
+
+// mapTlsHandshakeResult is split out from checkTlsHandshake so the
+// response-mapping itself is unit-testable without a live backend -
+// mirrors mapVlessSpeedTestResult's role for checkVlessSpeed.
+export function mapTlsHandshakeResult(check: any, nodeId: string): TlsHandshakeResult {
+  const run = check?.runs?.find((r: any) => r.node_id === nodeId);
+  const result = run?.result;
+  if (!result) {
+    return { success: false, errorMessage: 'нет ответа от узла' };
+  }
+  if (!result.success) {
+    return { success: false, errorMessage: translateCheckError(result.error_message) ?? 'ошибка' };
+  }
+  return { success: true, latencyMs: typeof result.latency_ms === 'number' ? result.latency_ms : undefined };
+}
+
+// checkTlsHandshake: dispatches a "tls" check to one node - always a real
+// node, never "server" (there is no server-side equivalent, this only
+// means something from a node's own network vantage point).
+// allow_insecure is fixed true - only handshake speed matters here, not
+// certificate trust (the placeholder's own TLS termination is the user's
+// relay, not this repo). See
+// docs/superpowers/specs/2026-08-12-tls-handshake-check-design.md.
+export async function checkTlsHandshake(ip: string, sni: string, routerName: string): Promise<TlsHandshakeResult> {
+  const { id: nodeId } = await resolveNodeId(routerName);
+  const created = (await fetchWithAuth(
+    '/api/v1/checks',
+    'POST',
+    {
+      type: 'tls',
+      targets: [ip],
+      params: { port: 443, sni, allow_insecure: true },
+      node_selector: { node_ids: [nodeId] }
+    },
+    'api'
+  )) as any;
+  const checkId = created.batch_id ? created.checks[0].id : created.id;
+  const check = await pollCheckUntilDone(checkId);
+  return mapTlsHandshakeResult(check, nodeId);
+}
