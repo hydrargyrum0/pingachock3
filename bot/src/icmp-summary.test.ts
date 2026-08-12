@@ -53,6 +53,15 @@ test('translateCheckError maps known Go classification tokens to Russian', () =>
   assert.equal(translateCheckError('dns resolution failed'), 'домен не резолвится');
 });
 
+// The TLS Handshake check's supplementary ICMP diagnosis (internal/checks/
+// tls.go diagnoseUnreachable) - tells "the whole host is down" apart from
+// "just this port is filtered, host answers pings fine", per the user
+// report that TLS Handshake results were unclear about why a check failed.
+test('translateCheckError maps the TLS Handshake ICMP-diagnosis tokens to Russian', () => {
+  assert.equal(translateCheckError('ip unreachable'), 'IP адрес недоступен (не отвечает на ping)');
+  assert.equal(translateCheckError('port unreachable'), 'порт недоступен (хост отвечает на ping)');
+});
+
 test('translateCheckError passes through an unrecognized token unchanged rather than dropping it', () => {
   assert.equal(translateCheckError('some future token'), 'some future token');
 });

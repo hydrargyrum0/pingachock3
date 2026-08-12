@@ -194,6 +194,25 @@ func TestTLSCheckerHandshakeDeadline(t *testing.T) {
 	}
 }
 
+func TestClassifyUnreachable(t *testing.T) {
+	cases := []struct {
+		name string
+		recv int
+		want string
+	}{
+		{"no replies at all -> the ip itself doesn't answer", 0, "ip unreachable"},
+		{"at least one reply -> host is up, just this port isn't", 1, "port unreachable"},
+		{"multiple replies", 2, "port unreachable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyUnreachable(tc.recv); got != tc.want {
+				t.Errorf("classifyUnreachable(%d) = %q, want %q", tc.recv, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestChooseSNI(t *testing.T) {
 	cases := []struct {
 		name     string

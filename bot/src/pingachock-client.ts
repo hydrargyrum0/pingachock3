@@ -289,7 +289,13 @@ const CHECK_ERROR_TRANSLATIONS: Record<string, string> = {
   'ping failed': 'ошибка проверки',
   'connection refused': 'соединение отклонено',
   'connection failed': 'не удалось подключиться',
-  'certificate verification failed': 'ошибка проверки сертификата'
+  'certificate verification failed': 'ошибка проверки сертификата',
+  // TLSChecker's supplementary ICMP probe (internal/checks/tls.go,
+  // diagnoseUnreachable) - fired only for the ambiguous "timeout"/
+  // "connection failed" buckets above, telling apart "whole host is down"
+  // from "just this port is filtered, host answers pings fine".
+  'ip unreachable': 'IP адрес недоступен (не отвечает на ping)',
+  'port unreachable': 'порт недоступен (хост отвечает на ping)'
 };
 
 export function translateCheckError(message: string | null | undefined): string | undefined {

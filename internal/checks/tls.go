@@ -1,10 +1,12 @@
 package checks
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"net"
+	"os/exec"
 	"strconv"
 	"time"
 )
@@ -109,9 +111,67 @@ func (TLSChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 	}
 	if succeeded == 0 && lastErr != nil {
 		msg := classifyNetError(lastErr)
+		// "timeout" and "connection failed" are ambiguous on their own - a
+		// user reported getting a TLS Handshake result "sometimes, sometimes
+		// not" with no way to tell why. Both cases mean "never even got a
+		// TLS byte back", which happens for two very different reasons: the
+		// whole host is silent (down, or ICMP+TCP both filtered), or just
+		// this specific port is filtered while the host answers pings fine.
+		// A supplementary ICMP probe tells them apart. Skipped when ctx is
+		// already past its deadline - a ping run doomed to fail purely from
+		// running out of time would misreport as "ip unreachable" for a
+		// reason that has nothing to do with the target.
+		if (msg == "timeout" || msg == "connection failed") && ctx.Err() == nil {
+			msg = diagnoseUnreachable(ctx, netCfg, probeTarget)
+		}
 		res.ErrorMessage = &msg
 	}
 	return res
+}
+
+// diagnoseUnreachable runs a short supplementary ICMP probe against
+// probeTarget and folds the result into one of two stable classification
+// tokens - see the call site's doc comment for why this only fires for the
+// ambiguous "timeout"/"connection failed" cases.
+func diagnoseUnreachable(ctx context.Context, netCfg NetConfig, probeTarget string) string {
+	return classifyUnreachable(diagnosticPingReceived(ctx, netCfg, probeTarget))
+}
+
+// classifyUnreachable is diagnoseUnreachable's decision logic, split out so
+// it's unit-testable without actually shelling out to the OS ping binary -
+// mirrors classifyPingError's role in ping.go.
+func classifyUnreachable(recv int) string {
+	if recv > 0 {
+		return "port unreachable"
+	}
+	return "ip unreachable"
+}
+
+// diagnosticPingReceived shells out to the OS ping binary (pingArgs/
+// parsePingOutput, same as PingChecker) for a single quick packet and
+// returns how many replies came back (0 or 1). Deliberately smaller than
+// PingChecker's own defaults (1 packet, 1.5s vs. 4 packets/5s each) - this
+// already runs after a failed TLS attempt has burned its own budget, so it
+// stays a cheap supplementary probe, not a second full ping check. Just one
+// packet also sidesteps Windows ping.exe's fixed ~1s pacing between
+// packets, which would otherwise make even a 2-packet probe add a
+// second-plus of latency on every ambiguous TLS failure.
+func diagnosticPingReceived(ctx context.Context, netCfg NetConfig, target string) int {
+	const pingCount = 1
+	const pingTimeoutMs = 1500
+	overall := time.Duration(pingTimeoutMs)*time.Millisecond*time.Duration(pingCount) + 3*time.Second
+	cmdCtx, cancel := context.WithTimeout(ctx, overall)
+	defer cancel()
+
+	args := pingArgs(target, pingCount, pingTimeoutMs, netCfg.LocalAddr)
+	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	_ = cmd.Run()
+
+	_, recv, _ := parsePingOutput(out.String())
+	return recv
 }
 
 // chooseSNI: an explicit sni always wins - that's how the Cloudflare-

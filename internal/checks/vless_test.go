@@ -66,6 +66,39 @@ func TestPatchInboundReplacesExistingInbounds(t *testing.T) {
 	}
 }
 
+// TestPatchInboundOverridesLogConfig: the reported bug was a client-exported
+// config's log.access pointing at a path only the exporting app's own OS
+// sandbox has (e.g. an iOS App Group container) - xray-core fails to open
+// it at startup and exits before it can even log why, showing up as "xray
+// failed to start (no output)". patchInbound must discard whatever "log"
+// the caller supplied, the same way it already discards "inbounds".
+func TestPatchInboundOverridesLogConfig(t *testing.T) {
+	input := json.RawMessage(`{
+		"log": {"access": "/private/var/mobile/Containers/Shared/AppGroup/whatever/access.log", "dnsLog": true, "loglevel": "Error"},
+		"outbounds": [{"protocol": "vless"}]
+	}`)
+	patched, err := patchInbound(input, 12345)
+	if err != nil {
+		t.Fatalf("patchInbound() error = %v", err)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(patched, &doc); err != nil {
+		t.Fatalf("unmarshal patched config: %v", err)
+	}
+
+	logCfg, ok := doc["log"].(map[string]any)
+	if !ok {
+		t.Fatalf("log = %v (%T), want an object", doc["log"], doc["log"])
+	}
+	if _, hasAccess := logCfg["access"]; hasAccess {
+		t.Errorf("log.access = %v, want it stripped - the caller's path doesn't exist on this node", logCfg["access"])
+	}
+	if _, hasError := logCfg["error"]; hasError {
+		t.Errorf("log.error = %v, want it stripped", logCfg["error"])
+	}
+}
+
 func TestPatchInboundRejectsInvalidJSON(t *testing.T) {
 	_, err := patchInbound(json.RawMessage(`not json`), 1234)
 	if err == nil {

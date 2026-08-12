@@ -82,8 +82,15 @@ func (VLESSChecker) Run(ctx context.Context, netCfg NetConfig, target string, ra
 	defer cancel()
 
 	cmd := exec.CommandContext(overallCtx, xrayPath, "run", "-c", configFile)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	// Combined, not stderr-only: xray-core writes its own startup/config
+	// fatal errors to stdout by default (only access/error logs go where
+	// the config's "log" block points them - see patchInbound's doc
+	// comment). Watching stderr alone meant a real startup failure showed
+	// up as the unhelpful "xray failed to start (no output)" even though
+	// xray had, in fact, said exactly why on stdout.
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
 	if err := cmd.Start(); err != nil {
 		msg := "could not start xray: " + err.Error()
 		return Result{Success: false, ErrorMessage: &msg}
@@ -96,7 +103,7 @@ func (VLESSChecker) Run(ctx context.Context, netCfg NetConfig, target string, ra
 	}()
 
 	if err := waitForPort(overallCtx, port, vlessStartupTimeout); err != nil {
-		msg := classifyXrayStartupError(stderr.String())
+		msg := classifyXrayStartupError(output.String())
 		return Result{Success: false, ErrorMessage: &msg}
 	}
 
@@ -131,7 +138,21 @@ func freePort() (int, error) {
 // listening side so it's guaranteed to never be reachable from outside
 // the node and always at the port the caller (Run, above) already knows
 // to dial for the speed test. Every other top-level key (outbounds,
-// routing, ...) passes through with its original content unchanged.
+// routing, ...) passes through with its original content unchanged -
+// except "log" (see below).
+//
+// "log" is also forced, for a concrete failure this shipped with: configs
+// exported from mobile VPN apps routinely set log.access to a path inside
+// that app's own OS sandbox (e.g. an iOS App Group container under
+// /private/var/mobile/...), which obviously doesn't exist on whatever node
+// runs this check. xray-core fails to open that path at startup and exits
+// immediately, before it can even open its SOCKS listener - the caller
+// only ever saw "xray failed to start (no output)" (fixed separately by
+// capturing combined stdout+stderr in Run, above, but that only makes the
+// underlying failure visible, not fixed). A client-exported config's log
+// destinations are meaningless on this node regardless, so this always
+// wins over whatever the caller supplied - loglevel "warning" is enough to
+// still surface genuine config/startup errors on stdout.
 func patchInbound(config json.RawMessage, port int) (json.RawMessage, error) {
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(config, &doc); err != nil {
@@ -149,6 +170,7 @@ func patchInbound(config json.RawMessage, port int) (json.RawMessage, error) {
 		return nil, err
 	}
 	doc["inbounds"] = inboundsJSON
+	doc["log"] = json.RawMessage(`{"loglevel":"warning"}`)
 
 	return json.Marshal(doc)
 }
