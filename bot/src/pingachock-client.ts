@@ -191,8 +191,8 @@ async function createBatchedCheck(spec: CheckSpec, targets: string[], nodeId: st
   return [created.id];
 }
 
-async function pollCheckUntilDone(checkId: string): Promise<any> {
-  const deadline = Date.now() + NODE_POLL_TIMEOUT_MS;
+async function pollCheckUntilDone(checkId: string, timeoutMs: number = NODE_POLL_TIMEOUT_MS): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     const check = await fetchWithAuth(`/api/v1/checks/${checkId}?expand=runs`, 'GET', undefined, 'api');
     const status = (check as any)?.status;
@@ -392,4 +392,55 @@ export function mapUpgradeScanResults(data: any): UpgradeScanResult[] {
 export async function scanUpgrade(targets: string[]): Promise<UpgradeScanResult[]> {
   const data = await fetchWithAuth('/api/v1/server-upgrade-scan', 'POST', { targets }, 'api');
   return mapUpgradeScanResults(data);
+}
+
+export type VlessSpeedTestResult = { success: boolean; mbps?: number; errorMessage?: string };
+
+function parseVlessRaw(raw: unknown): { mbps: number | null } {
+  if (!raw) return { mbps: null };
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return { mbps: typeof parsed?.mbps === 'number' ? parsed.mbps : null };
+  } catch {
+    return { mbps: null };
+  }
+}
+
+// mapVlessSpeedTestResult is split out from checkVlessSpeed so the
+// response-mapping itself is unit-testable without a live backend or a
+// real VLESS server - mirrors mapUpgradeScanResults's role for scanUpgrade.
+export function mapVlessSpeedTestResult(check: any, nodeId: string): VlessSpeedTestResult {
+  const run = check?.runs?.find((r: any) => r.node_id === nodeId);
+  const result = run?.result;
+  if (!result) {
+    return { success: false, errorMessage: 'нет ответа от узла' };
+  }
+  if (!result.success) {
+    return { success: false, errorMessage: translateCheckError(result.error_message) ?? 'ошибка' };
+  }
+  const { mbps } = parseVlessRaw(result.raw);
+  return { success: true, mbps: mbps ?? undefined };
+}
+
+// checkVlessSpeed: dispatches a "vless" check to one node - always a real
+// node, never "server" (there is no server-side equivalent for this
+// check, it only means something from a node's own network vantage
+// point). config is the full xray-core config.json the caller already
+// validated as parseable JSON. 90000ms: comfortably above the Go side's
+// own 30s vlessOverallTimeout plus poll-interval slack, while staying
+// under Telegraf's handlerTimeout: 120_000 configured in
+// bot/src/index.ts - see NODE_POLL_TIMEOUT_MS's own doc comment for why
+// that headroom matters (a real past incident, not a hypothetical one).
+// See docs/superpowers/specs/2026-08-12-vless-speedtest-check-design.md.
+export async function checkVlessSpeed(config: unknown, routerName: string): Promise<VlessSpeedTestResult> {
+  const { id: nodeId } = await resolveNodeId(routerName);
+  const created = (await fetchWithAuth(
+    '/api/v1/checks',
+    'POST',
+    { type: 'vless', targets: ['vless-speedtest'], params: { config }, node_selector: { node_ids: [nodeId] } },
+    'api'
+  )) as any;
+  const checkId = created.batch_id ? created.checks[0].id : created.id;
+  const check = await pollCheckUntilDone(checkId, 90000);
+  return mapVlessSpeedTestResult(check, nodeId);
 }
