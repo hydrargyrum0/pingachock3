@@ -23,6 +23,8 @@ var validCheckTypes = map[store.CheckType]bool{
 	store.CheckTypeDNS:        true,
 	store.CheckTypeTLS:        true,
 	store.CheckTypeTraceroute: true,
+	store.CheckTypeUpgrade:    true,
+	store.CheckTypeVless:      true,
 }
 
 type createCheckRequest struct {

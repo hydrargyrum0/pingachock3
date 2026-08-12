@@ -526,7 +526,7 @@ components:
       properties:
         type:
           type: string
-          enum: [ping, tcp, http, dns, tls, traceroute]
+          enum: [ping, tcp, http, dns, tls, traceroute, upgrade, vless]
         target: { type: string, description: "один таргет" }
         targets:
           type: array

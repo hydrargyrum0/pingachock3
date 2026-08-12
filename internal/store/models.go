@@ -59,6 +59,8 @@ const (
 	CheckTypeDNS        CheckType = "dns"
 	CheckTypeTLS        CheckType = "tls"
 	CheckTypeTraceroute CheckType = "traceroute"
+	CheckTypeUpgrade    CheckType = "upgrade"
+	CheckTypeVless      CheckType = "vless"
 )
 
 type CheckStatus string
