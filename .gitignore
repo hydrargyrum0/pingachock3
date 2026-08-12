@@ -3,3 +3,4 @@ agent.json
 *.log
 .DS_Store
 .env
+/internal/checks/embedded/
