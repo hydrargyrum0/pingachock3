@@ -22,7 +22,11 @@
       "Bash(grep -rn 'either ServerName or InsecureSkipVerify' __CMDSUB_OUTPUT__/src/crypto/tls/)",
       "Bash(sed -n 1,60p __CMDSUB_OUTPUT__/src/crypto/tls/handshake_client.go)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:8080/healthz --max-time 2)",
-      "Bash(sent, 0 'received \\(100% loss that never happened\\). Now gated on whether *)"
+      "Bash(sent, 0 'received \\(100% loss that never happened\\). Now gated on whether *)",
+      "Bash(go mod *)",
+      "Bash(grep -E \"^\\\\s{2}[a-z_]+:$\" docker-compose.prod.yml)",
+      "Bash(python3 -c \"import yaml; yaml.safe_load\\(open\\('internal/api/openapi.yaml', encoding='utf-8'\\)\\); print\\('YAML OK'\\)\")",
+      "Bash(python -c \"import yaml; yaml.safe_load\\(open\\('internal/api/openapi.yaml', encoding='utf-8'\\)\\); print\\('YAML OK'\\)\")"
     ]
   }
 }
