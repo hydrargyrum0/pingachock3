@@ -763,9 +763,10 @@ function pingKeyboard(session: MySession) {
 // chosen node at a time. See
 // docs/superpowers/specs/2026-08-12-vless-speedtest-check-design.md.
 function getVlessRouterOption(session: MySession): { label: string; value: string } {
-  const routers = session.vlessRouters ?? [];
+  const routers = (session.vlessRouters ?? []).filter((r) => !r.is_virtual);
   const options: Array<{ label: string; value: string }> = [
     { label: pingRouterLabels.auto, value: 'auto' },
+    { label: '🖥 Server', value: 'server' },
     ...routers.map((r) => ({ label: r.name, value: r.name }))
   ];
   const index = session.vlessRouterIndex ?? 0;
@@ -784,9 +785,10 @@ function vlessKeyboard(session: MySession) {
 // router-toggle state, no "ALL" - same reasoning as VLESS Speedtest's own
 // picker (one chosen node at a time).
 function getTlsHandshakeRouterOption(session: MySession): { label: string; value: string } {
-  const routers = session.tlsHandshakeRouters ?? [];
+  const routers = (session.tlsHandshakeRouters ?? []).filter((r) => !r.is_virtual);
   const options: Array<{ label: string; value: string }> = [
     { label: pingRouterLabels.auto, value: 'auto' },
+    { label: '🖥 Server', value: 'server' },
     ...routers.map((r) => ({ label: r.name, value: r.name }))
   ];
   const index = session.tlsHandshakeRouterIndex ?? 0;
@@ -3224,7 +3226,7 @@ bot.action('extra:vlessspeedtest', async (ctx) => {
   try {
     const allRouters = await apiClient.listRouters();
     ctx.session.vlessRouters = allRouters.filter((r) => r.status === 'online');
-    const optionsLen = 1 + (ctx.session.vlessRouters?.length ?? 0);
+    const optionsLen = 2 + (ctx.session.vlessRouters ?? []).filter((r) => !r.is_virtual).length;
     if (optionsLen > 0 && (ctx.session.vlessRouterIndex ?? 0) >= optionsLen) {
       ctx.session.vlessRouterIndex = 0;
     }
@@ -3245,7 +3247,7 @@ bot.action('extra:vlessspeedtest', async (ctx) => {
 bot.action('extra:vless_toggle_router', async (ctx) => {
   if (!(await isAuthorizedUser(ctx))) return;
   await ctx.answerCbQuery();
-  const optionsLen = 1 + (ctx.session.vlessRouters?.length ?? 0);
+  const optionsLen = 2 + (ctx.session.vlessRouters ?? []).filter((r) => !r.is_virtual).length;
   ctx.session.vlessRouterIndex = ((ctx.session.vlessRouterIndex ?? 0) + 1) % Math.max(1, optionsLen);
   await safeEditOrIgnore(
     ctx,
@@ -3262,7 +3264,7 @@ bot.action('extra:tlshandshake', async (ctx) => {
   try {
     const allRouters = await apiClient.listRouters();
     ctx.session.tlsHandshakeRouters = allRouters.filter((r) => r.status === 'online');
-    const optionsLen = 1 + (ctx.session.tlsHandshakeRouters?.length ?? 0);
+    const optionsLen = 2 + (ctx.session.tlsHandshakeRouters ?? []).filter((r) => !r.is_virtual).length;
     if (optionsLen > 0 && (ctx.session.tlsHandshakeRouterIndex ?? 0) >= optionsLen) {
       ctx.session.tlsHandshakeRouterIndex = 0;
     }
@@ -3283,7 +3285,7 @@ bot.action('extra:tlshandshake', async (ctx) => {
 bot.action('extra:tls_toggle_router', async (ctx) => {
   if (!(await isAuthorizedUser(ctx))) return;
   await ctx.answerCbQuery();
-  const optionsLen = 1 + (ctx.session.tlsHandshakeRouters?.length ?? 0);
+  const optionsLen = 2 + (ctx.session.tlsHandshakeRouters ?? []).filter((r) => !r.is_virtual).length;
   ctx.session.tlsHandshakeRouterIndex = ((ctx.session.tlsHandshakeRouterIndex ?? 0) + 1) % Math.max(1, optionsLen);
   await safeEditOrIgnore(
     ctx,
