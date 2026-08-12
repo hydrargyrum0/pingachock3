@@ -1,0 +1,5 @@
+.git
+bin/
+internal/checks/embedded/
+bot/node_modules/
+bot/dist/

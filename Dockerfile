@@ -3,12 +3,15 @@
 # needed at deploy time.
 FROM golang:1.26-alpine AS build
 WORKDIR /src
+RUN apk add --no-cache curl unzip
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY cmd/server ./cmd/server
 COPY internal ./internal
+COPY scripts/fetch-xray.sh ./scripts/fetch-xray.sh
+RUN sh scripts/fetch-xray.sh linux amd64
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/pingachock-server ./cmd/server
 
 FROM alpine:3.20
