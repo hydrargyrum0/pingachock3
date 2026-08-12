@@ -400,14 +400,38 @@ export function mapUpgradeScanResults(data: any): UpgradeScanResult[] {
   return results.map((r: any) => ({ target: String(r?.target ?? ''), matched: Boolean(r?.matched) }));
 }
 
-// scanUpgrade: HTTP 101 (websocket upgrade) check, always against the
-// backend itself (see /api/v1/server-upgrade-scan) - there is no
-// node-routed equivalent, this check only ever makes sense from the
-// server's own vantage point. See
-// docs/superpowers/specs/2026-08-09-http-101-upgrade-check-design.md.
-export async function scanUpgrade(targets: string[]): Promise<UpgradeScanResult[]> {
-  const data = await fetchWithAuth('/api/v1/server-upgrade-scan', 'POST', { targets }, 'api');
-  return mapUpgradeScanResults(data);
+// mergeUpgradeScanChecks merges the node-dispatch path's one-check-per-target
+// results back into the same UpgradeScanResult[] shape
+// mapUpgradeScanResults produces for the server path, so
+// bot/src/index.ts's rendering code doesn't need to know which path ran.
+export function mergeUpgradeScanChecks(targets: string[], checks: any[], nodeId: string): UpgradeScanResult[] {
+  return targets.map((target, i) => {
+    const run = checks[i]?.runs?.find((r: any) => r.node_id === nodeId);
+    return { target, matched: Boolean(run?.result?.success) };
+  });
+}
+
+// scanUpgrade: routerName 'server' (the default) keeps using the
+// synchronous /api/v1/server-upgrade-scan endpoint unchanged; any other
+// value dispatches an "upgrade" check to that node through the same
+// generic /api/v1/checks path ping's own node-routed dispatch uses. See
+// docs/superpowers/specs/2026-08-12-extra-checks-server-and-node-design.md.
+export async function scanUpgrade(targets: string[], routerName: string = 'server'): Promise<UpgradeScanResult[]> {
+  if (routerName === 'server') {
+    const data = await fetchWithAuth('/api/v1/server-upgrade-scan', 'POST', { targets }, 'api');
+    return mapUpgradeScanResults(data);
+  }
+
+  const { id: nodeId } = await resolveNodeId(routerName);
+  const created = (await fetchWithAuth(
+    '/api/v1/checks',
+    'POST',
+    { type: 'upgrade', targets, node_selector: { node_ids: [nodeId] } },
+    'api'
+  )) as any;
+  const checkIds: string[] = created.batch_id ? created.checks.map((c: any) => c.id) : [created.id];
+  const checks = await Promise.all(checkIds.map((id: string) => pollCheckUntilDone(id)));
+  return mergeUpgradeScanChecks(targets, checks, nodeId);
 }
 
 export type VlessSpeedTestResult = { success: boolean; mbps?: number; errorMessage?: string };

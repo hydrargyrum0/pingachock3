@@ -29,6 +29,8 @@ type MySession = {
   healthRouters?: Router[];
 
   awaitingUpgradeScanTargets?: boolean;
+  upgradeScanRouterIndex?: number;
+  upgradeScanRouters?: Router[];
 
   awaitingVlessConfig?: boolean;
   vlessRouterIndex?: number;
@@ -799,6 +801,39 @@ function tlsHandshakeKeyboard(session: MySession) {
   const routerOpt = getTlsHandshakeRouterOption(session);
   return Markup.inlineKeyboard([
     [Markup.button.callback(routerOpt.label, 'extra:tls_toggle_router')],
+    [Markup.button.callback('◀️ Назад', 'menu:root')]
+  ]);
+}
+
+// getUpgradeScanRouterOption/upgradeScanRouterPickerKeyboard: same router
+// list shape as VLESS/TLS Handshake's own pickers, but with an extra
+// "✅ Продолжить" confirm button - HTTP 101 check's existing target-list
+// prompt keyboard is extraChecksKeyboard(), not a router toggle, so
+// grafting the toggle directly onto that same message would silently
+// change what tapping it does mid-flow. An explicit confirm step avoids
+// that ambiguity; VLESS/TLS Handshake don't need it because their toggle
+// and their target/config prompt already live on the same message
+// throughout.
+function getUpgradeScanRouterOption(session: MySession): { label: string; value: string } {
+  const routers = (session.upgradeScanRouters ?? []).filter((r) => !r.is_virtual);
+  const options: Array<{ label: string; value: string }> = [
+    { label: pingRouterLabels.auto, value: 'auto' },
+    { label: '🖥 Server', value: 'server' },
+    ...routers.map((r) => ({ label: r.name, value: r.name }))
+  ];
+  const index = session.upgradeScanRouterIndex ?? 0;
+  return options[Math.max(0, Math.min(index, options.length - 1))];
+}
+
+function upgradeScanRouterOptionsLen(session: MySession): number {
+  return 2 + (session.upgradeScanRouters ?? []).filter((r) => !r.is_virtual).length;
+}
+
+function upgradeScanRouterPickerKeyboard(session: MySession) {
+  const routerOpt = getUpgradeScanRouterOption(session);
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(routerOpt.label, 'extra:upgrade_toggle_router')],
+    [Markup.button.callback('✅ Продолжить', 'extra:upgrade_confirm_router')],
     [Markup.button.callback('◀️ Назад', 'menu:root')]
   ]);
 }
@@ -2087,15 +2122,17 @@ bot.on('text', async (ctx, next) => {
       return;
     }
 
+    const routerOpt = getUpgradeScanRouterOption(ctx.session);
     ctx.session.awaitingUpgradeScanTargets = false;
 
     try {
-      const results = await apiClient.scanUpgrade(parsed.targets);
+      const results = await apiClient.scanUpgrade(parsed.targets, routerOpt.value);
       const lines = results.map((r) => `${r.matched ? '✅' : '❌'} ${r.target}`);
       const matchedCount = results.filter((r) => r.matched).length;
       const reportText =
         `HTTP 101 check (Websocket)\n` +
-        `Время проверки: ${formatHumanDate(new Date())}\n\n` +
+        `Время проверки: ${formatHumanDate(new Date())}\n` +
+        `Узел: ${routerOpt.label}\n\n` +
         `${lines.join('\n')}\n\n` +
         `Итог: ${matchedCount} из ${results.length} отвечают условию`;
 
@@ -3194,6 +3231,7 @@ bot.action('menu:root', async (ctx) => {
   ctx.session.awaitingUpgradeScanTargets = false;
   ctx.session.awaitingVlessConfig = false;
   ctx.session.awaitingTlsHandshakeTarget = false;
+  ctx.session.upgradeScanRouterIndex = 0;
   await ctx.answerCbQuery();
   await safeEditOrReply(ctx, await renderMainMenuText(), mainMenuKeyboard());
 });
@@ -3204,10 +3242,48 @@ bot.action('menu:extra', async (ctx) => {
   ctx.session.awaitingUpgradeScanTargets = false;
   ctx.session.awaitingVlessConfig = false;
   ctx.session.awaitingTlsHandshakeTarget = false;
+  ctx.session.upgradeScanRouterIndex = 0;
   await safeEditOrReply(ctx, 'Дополнительные проверки:', extraChecksKeyboard());
 });
 
 bot.action('extra:http101', async (ctx) => {
+  if (!(await isAuthorizedUser(ctx))) return;
+  await ctx.answerCbQuery();
+
+  ctx.session.upgradeScanRouterIndex = ctx.session.upgradeScanRouterIndex ?? 0;
+  try {
+    const allRouters = await apiClient.listRouters();
+    ctx.session.upgradeScanRouters = allRouters.filter((r) => r.status === 'online');
+    const optionsLen = upgradeScanRouterOptionsLen(ctx.session);
+    if (optionsLen > 0 && (ctx.session.upgradeScanRouterIndex ?? 0) >= optionsLen) {
+      ctx.session.upgradeScanRouterIndex = 0;
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    await safeEditOrReply(ctx, `Ошибка:\n${errMsg}`, extraChecksKeyboard());
+    return;
+  }
+
+  await safeEditOrReply(
+    ctx,
+    'Выбери узел (кнопка ниже), затем нажми ещё раз для подтверждения.',
+    upgradeScanRouterPickerKeyboard(ctx.session)
+  );
+});
+
+bot.action('extra:upgrade_toggle_router', async (ctx) => {
+  if (!(await isAuthorizedUser(ctx))) return;
+  await ctx.answerCbQuery();
+  const optionsLen = upgradeScanRouterOptionsLen(ctx.session);
+  ctx.session.upgradeScanRouterIndex = ((ctx.session.upgradeScanRouterIndex ?? 0) + 1) % Math.max(1, optionsLen);
+  await safeEditOrIgnore(
+    ctx,
+    'Выбери узел (кнопка ниже), затем нажми ещё раз для подтверждения.',
+    upgradeScanRouterPickerKeyboard(ctx.session)
+  );
+});
+
+bot.action('extra:upgrade_confirm_router', async (ctx) => {
   if (!(await isAuthorizedUser(ctx))) return;
   await ctx.answerCbQuery();
   ctx.session.awaitingUpgradeScanTargets = true;
