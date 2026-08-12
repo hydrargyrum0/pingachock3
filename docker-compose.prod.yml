@@ -65,6 +65,12 @@ services:
     networks:
       - internal
 
+  handshake-target:
+    build: { context: ., dockerfile: Dockerfile.handshaketarget }
+    restart: unless-stopped
+    ports:
+      - "1343:1343"
+
 networks:
   internal:
 

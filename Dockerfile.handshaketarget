@@ -1,0 +1,17 @@
+# Placeholder WebSocket target for TLS-handshake-speed checks - see
+# docs/superpowers/specs/2026-08-12-tls-handshake-check-design.md. No real
+# function beyond completing the WS opening handshake; doesn't import
+# internal/, doesn't need ca-certificates (makes no outbound TLS calls).
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd/handshaketarget ./cmd/handshaketarget
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/handshaketarget ./cmd/handshaketarget
+
+FROM alpine:3.20
+COPY --from=build /out/handshaketarget /usr/local/bin/handshaketarget
+EXPOSE 1343
+ENTRYPOINT ["/usr/local/bin/handshaketarget"]
