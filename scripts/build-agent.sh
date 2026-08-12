@@ -7,6 +7,15 @@ set -eu
 cd "$(dirname "$0")/.."
 mkdir -p bin
 
+# The vless check type embeds xray-core per-platform via //go:embed - see
+# internal/checks/xray_*.go and
+# docs/superpowers/specs/2026-08-12-vless-speedtest-check-design.md. Those
+# binaries aren't in git (fetch-xray.sh's own output dir is gitignored),
+# so a fresh checkout needs them fetched before any of the six go build
+# calls below - each one will fail with a "no matching files found" embed
+# error otherwise.
+sh "$(dirname "$0")/fetch-xray.sh"
+
 build() {
   os="$1"; arch="$2"; ext="$3"
   out="bin/pingachock-agent-${os}-${arch}${ext}"
