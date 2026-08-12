@@ -1,6 +1,6 @@
 # TLS handshake speed check + placeholder target — design
 
-Status: APPROVED, ready for implementation planning.
+Status: DONE. Implemented per docs/superpowers/plans/2026-08-12-tls-handshake-check.md.
 
 ## Problem
 
