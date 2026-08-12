@@ -8,6 +8,7 @@ export type Router = {
   status: string;
   platform: string;
   blocked: boolean;
+  is_virtual: boolean;
   last_seen: string | null;
   created_at?: string;
 };
@@ -84,6 +85,7 @@ function toRouter(n: any): Router {
     status: n.online ? 'online' : 'offline',
     platform: String(n.platform ?? ''),
     blocked: Boolean(n.blocked),
+    is_virtual: Boolean(n.is_virtual),
     last_seen: n.last_seen_at ? String(n.last_seen_at) : null,
     created_at: n.created_at ? String(n.created_at) : undefined
   };
@@ -133,10 +135,24 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// pickAutoRouter is resolveNodeId's "auto" logic pulled out as a pure,
+// testable function - the bug this fixes: it used to have no is_virtual
+// awareness at all, so "auto" could silently resolve to the backend's own
+// virtual "server" node instead of a real one if that node happened to
+// sort first (GET /api/v1/nodes orders by created_at, and the virtual
+// node is provisioned at backend startup - plausible it sorts early). The
+// Go backend's own dispatch-time auto-selection
+// (internal/dispatch/dispatch.go's filterAvailable) already excludes
+// is_virtual correctly; this bot-side "auto" is a separate concept that
+// never got the same protection until now.
+export function pickAutoRouter(routers: Router[]): Router | null {
+  return routers.find((r) => r.status === 'online' && !r.blocked && !r.is_virtual) ?? null;
+}
+
 async function resolveNodeId(routerName: string): Promise<{ id: string; name: string }> {
   const routers = await listRouters();
   if (routerName === 'auto') {
-    const online = routers.find((r) => r.status === 'online' && !r.blocked);
+    const online = pickAutoRouter(routers);
     if (!online) throw new Error('No online routers available for "auto"');
     return { id: online.id, name: online.name };
   }
