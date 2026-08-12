@@ -30,6 +30,10 @@ type MySession = {
 
   awaitingUpgradeScanTargets?: boolean;
 
+  awaitingVlessConfig?: boolean;
+  vlessRouterIndex?: number;
+  vlessRouters?: Router[];
+
   awaitingRemnaUrl?: boolean;
   awaitingRemnaToken?: boolean;
   awaitingRemnaIgnoreList?: boolean;
@@ -147,6 +151,7 @@ function mainMenuKeyboard() {
 function extraChecksKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('HTTP 101 check (Websocket)', 'extra:http101')],
+    [Markup.button.callback('VLESS Speedtest', 'extra:vlessspeedtest')],
     [Markup.button.callback('◀️ Назад', 'menu:root')]
   ]);
 }
@@ -743,6 +748,29 @@ function pingKeyboard(session: MySession) {
   return Markup.inlineKeyboard([
     [Markup.button.callback(routerOpt.label, 'ping:toggle_router')],
     [Markup.button.callback(portsOpt.label, 'ping:toggle_ports')],
+    [Markup.button.callback('◀️ Назад', 'menu:root')]
+  ]);
+}
+
+// getVlessRouterOption/vlessKeyboard: own independent router-toggle state
+// (vlessRouterIndex/vlessRouters), deliberately no "ALL" entry unlike
+// getPingRouterOption - a VLESS speedtest only makes sense against one
+// chosen node at a time. See
+// docs/superpowers/specs/2026-08-12-vless-speedtest-check-design.md.
+function getVlessRouterOption(session: MySession): { label: string; value: string } {
+  const routers = session.vlessRouters ?? [];
+  const options: Array<{ label: string; value: string }> = [
+    { label: pingRouterLabels.auto, value: 'auto' },
+    ...routers.map((r) => ({ label: r.name, value: r.name }))
+  ];
+  const index = session.vlessRouterIndex ?? 0;
+  return options[Math.max(0, Math.min(index, options.length - 1))];
+}
+
+function vlessKeyboard(session: MySession) {
+  const routerOpt = getVlessRouterOption(session);
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(routerOpt.label, 'extra:vless_toggle_router')],
     [Markup.button.callback('◀️ Назад', 'menu:root')]
   ]);
 }
@@ -1940,6 +1968,41 @@ bot.on('text', async (ctx, next) => {
     return;
   }
 
+  // Дополнительные проверки: VLESS Speedtest — ждём конфиг
+  if (ctx.session.awaitingVlessConfig && (await isAuthorizedUser(ctx))) {
+    const input = ctx.message.text.trim();
+    let config: unknown;
+    try {
+      config = JSON.parse(input);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await ctx.reply(`Конфиг не распарсился как JSON: ${errMsg}`, vlessKeyboard(ctx.session));
+      return;
+    }
+
+    const routerOpt = getVlessRouterOption(ctx.session);
+    ctx.session.awaitingVlessConfig = false;
+
+    const waitMsg = await ctx.reply('Поднимаю VLESS-туннель и гоняю speedtest, это может занять до ~40 секунд...');
+    try {
+      const result = await apiClient.checkVlessSpeed(config, routerOpt.value);
+      const reportText = result.success
+        ? `VLESS Speedtest\nВремя проверки: ${formatHumanDate(new Date())}\nУзел: ${routerOpt.label}\n\n✅ ${result.mbps != null ? result.mbps.toFixed(1) + ' Mbps' : 'туннель поднялся, скорость не измерена'}`
+        : `VLESS Speedtest\nВремя проверки: ${formatHumanDate(new Date())}\nУзел: ${routerOpt.label}\n\n❌ ошибка: ${result.errorMessage ?? 'неизвестная ошибка'}`;
+      await ctx.reply(reportText, extraChecksKeyboard());
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await ctx.reply(`Ошибка:\n${errMsg}`, extraChecksKeyboard());
+    } finally {
+      try {
+        await ctx.telegram.deleteMessage(ctx.chat!.id, waitMsg.message_id);
+      } catch {
+        // best-effort - not fatal if Telegram won't let us delete it
+      }
+    }
+    return;
+  }
+
   // Дополнительные проверки: HTTP 101 check — ждём список целей
   if (ctx.session.awaitingUpgradeScanTargets && (await isAuthorizedUser(ctx))) {
     const input = ctx.message.text.trim();
@@ -3073,6 +3136,7 @@ bot.action('menu:root', async (ctx) => {
   if (!(await isAuthorizedUser(ctx))) return;
   ctx.session.awaitingPingInput = false;
   ctx.session.awaitingUpgradeScanTargets = false;
+  ctx.session.awaitingVlessConfig = false;
   await ctx.answerCbQuery();
   await safeEditOrReply(ctx, await renderMainMenuText(), mainMenuKeyboard());
 });
@@ -3081,6 +3145,7 @@ bot.action('menu:extra', async (ctx) => {
   if (!(await isAuthorizedUser(ctx))) return;
   await ctx.answerCbQuery();
   ctx.session.awaitingUpgradeScanTargets = false;
+  ctx.session.awaitingVlessConfig = false;
   await safeEditOrReply(ctx, 'Дополнительные проверки:', extraChecksKeyboard());
 });
 
@@ -3092,6 +3157,44 @@ bot.action('extra:http101', async (ctx) => {
     ctx,
     'Пришли список хостов для HTTP 101 check (IPv4, CIDR, диапазон или домен, по одному на строку либо через запятую). Порт 443, протокол websocket. Максимум 100 целей.',
     extraChecksKeyboard()
+  );
+});
+
+bot.action('extra:vlessspeedtest', async (ctx) => {
+  if (!(await isAuthorizedUser(ctx))) return;
+  await ctx.answerCbQuery();
+
+  ctx.session.vlessRouterIndex = ctx.session.vlessRouterIndex ?? 0;
+  try {
+    const allRouters = await apiClient.listRouters();
+    ctx.session.vlessRouters = allRouters.filter((r) => r.status === 'online');
+    const optionsLen = 1 + (ctx.session.vlessRouters?.length ?? 0);
+    if (optionsLen > 0 && (ctx.session.vlessRouterIndex ?? 0) >= optionsLen) {
+      ctx.session.vlessRouterIndex = 0;
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    await safeEditOrReply(ctx, `Ошибка:\n${errMsg}`, extraChecksKeyboard());
+    return;
+  }
+
+  ctx.session.awaitingVlessConfig = true;
+  await safeEditOrReply(
+    ctx,
+    'Выбери узел (кнопка выше) и пришли конфиг xray-core целиком (JSON) одним сообщением.',
+    vlessKeyboard(ctx.session)
+  );
+});
+
+bot.action('extra:vless_toggle_router', async (ctx) => {
+  if (!(await isAuthorizedUser(ctx))) return;
+  await ctx.answerCbQuery();
+  const optionsLen = 1 + (ctx.session.vlessRouters?.length ?? 0);
+  ctx.session.vlessRouterIndex = ((ctx.session.vlessRouterIndex ?? 0) + 1) % Math.max(1, optionsLen);
+  await safeEditOrIgnore(
+    ctx,
+    'Выбери узел (кнопка выше) и пришли конфиг xray-core целиком (JSON) одним сообщением.',
+    vlessKeyboard(ctx.session)
   );
 });
 
