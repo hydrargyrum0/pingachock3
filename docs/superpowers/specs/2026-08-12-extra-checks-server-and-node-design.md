@@ -1,6 +1,6 @@
 # Дополнительные проверки: server + node everywhere — design
 
-Status: APPROVED, ready for implementation planning.
+Status: DONE. Implemented per docs/superpowers/plans/2026-08-12-extra-checks-server-and-node.md.
 
 ## Problem
 
