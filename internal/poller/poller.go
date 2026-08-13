@@ -20,7 +20,15 @@ type Poller struct {
 	AgentVersion  string
 	MaxConcurrent int
 	NetConfig     checks.NetConfig
-	Log           *slog.Logger
+
+	// PathTest, when set, is consulted right before every result
+	// submission - while it reports Suspect(), this tick's results are
+	// withheld instead of posted (see tick, below). nil (the default,
+	// unless cmd/agent wires one up) means "never withhold anything",
+	// identical to this feature not existing at all.
+	PathTest *PathSelfTest
+
+	Log *slog.Logger
 
 	// StatePath, if set, is where a snapshot of "what is the agent doing"
 	// gets written after every tick, so a separate invocation of this same
@@ -109,6 +117,11 @@ func (p *Poller) tick(ctx context.Context) {
 		}(job)
 	}
 	wg.Wait()
+
+	if p.PathTest != nil && p.PathTest.Suspect() {
+		p.Log.Warn("withholding this tick's results - path self-test currently suspects VPN/proxy interception", "count", len(results))
+		return
+	}
 
 	if err := p.Transport.PostResults(ctx, results); err != nil {
 		p.Log.Error("post results failed", "error", err, "count", len(results))
