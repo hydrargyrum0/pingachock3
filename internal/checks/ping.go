@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"pingachock/internal/netiface"
 )
 
 // PingChecker shells out to the OS's native ping binary rather than using
@@ -37,14 +39,20 @@ func (PingChecker) Run(ctx context.Context, netCfg NetConfig, target string, raw
 		p.TimeoutMs = 5000
 	}
 
-	resolvedTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target, time.Duration(p.TimeoutMs)*time.Millisecond, netCfg.LocalAddr)
+	boundIface, err := resolveBoundInterface(netCfg)
+	if err != nil {
+		msg := classifyNetError(err)
+		return Result{Success: false, ErrorMessage: &msg}
+	}
+
+	resolvedTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target, time.Duration(p.TimeoutMs)*time.Millisecond, boundIface.PreferredAddr())
 	resolutionFailed := net.ParseIP(target) == nil && reportedIP == ""
 
 	overall := time.Duration(p.TimeoutMs)*time.Millisecond*time.Duration(p.Count) + 5*time.Second
 	cmdCtx, cancel := context.WithTimeout(ctx, overall)
 	defer cancel()
 
-	args := pingArgs(resolvedTarget, p.Count, p.TimeoutMs, netCfg.LocalAddr)
+	args := pingArgs(resolvedTarget, p.Count, p.TimeoutMs, boundIface)
 	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -109,11 +117,17 @@ func classifyPingError(cmdCtxErr error, resolutionFailed bool, recv int) string 
 	}
 }
 
-func pingArgs(target string, count, timeoutMs int, localAddr net.IP) []string {
+// pingArgs' last parameter used to be a bare net.IP resolved once at agent
+// startup and cached in NetConfig.LocalAddr - now it's the pinned
+// interface's current state, resolved fresh by the caller on every single
+// Run() (see resolveBoundInterface in checks.go), so a DHCP-renewed address
+// is never stale here. iface's zero value (Interface{}) means "no interface
+// pinned" - identical to the old localAddr == nil case.
+func pingArgs(target string, count, timeoutMs int, iface netiface.Interface) []string {
 	if runtime.GOOS == "windows" {
 		args := []string{"ping", "-n", strconv.Itoa(count), "-w", strconv.Itoa(timeoutMs)}
-		if localAddr != nil {
-			args = append(args, "-S", localAddr.String())
+		if addr := iface.PreferredAddr(); addr != nil {
+			args = append(args, "-S", addr.String())
 		}
 		return append(args, target)
 	}
@@ -123,11 +137,20 @@ func pingArgs(target string, count, timeoutMs int, localAddr net.IP) []string {
 		timeoutSec = 1
 	}
 	args := []string{"ping", "-c", strconv.Itoa(count), "-W", strconv.Itoa(timeoutSec)}
-	if localAddr != nil {
+	if iface.Name != "" {
 		if runtime.GOOS == "darwin" {
-			args = append(args, "-S", localAddr.String()) // BSD ping: source address, not interface name
+			// BSD ping has no interface-name flag - a resolved address is
+			// the best available, same as Windows above.
+			if addr := iface.PreferredAddr(); addr != nil {
+				args = append(args, "-S", addr.String())
+			}
 		} else {
-			args = append(args, "-I", localAddr.String()) // iputils ping accepts an address here too
+			// GNU/iputils ping's -I accepts an interface *name* directly,
+			// which invokes SO_BINDTODEVICE internally - the same strong,
+			// routing-table-overriding guarantee BindControl uses
+			// elsewhere, for free, and stronger than binding a source
+			// address alone would be.
+			args = append(args, "-I", iface.Name)
 		}
 	}
 	return append(args, target)

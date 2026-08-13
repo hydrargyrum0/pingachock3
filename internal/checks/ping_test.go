@@ -2,6 +2,10 @@ package checks
 
 import (
 	"context"
+	"net"
+	"pingachock/internal/netiface"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -151,5 +155,29 @@ func TestClassifyPingError(t *testing.T) {
 				t.Errorf("classifyPingError(%v, %v, %d) = %q, want %q", tc.cmdCtxErr, tc.resolutionFailed, tc.recv, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestPingArgsLinuxUsesInterfaceNameNotAddress(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("pingArgs' Linux branch only runs its interface-name behavior on GOOS=linux")
+	}
+	ifc := netiface.Interface{Name: "eth-test", Addrs: []net.IP{net.ParseIP("192.168.1.50")}}
+	args := pingArgs("203.0.113.5", 4, 5000, ifc)
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-I eth-test") {
+		t.Errorf("pingArgs args = %v, want \"-I eth-test\" (bind by interface name, not address)", args)
+	}
+	if strings.Contains(joined, "192.168.1.50") {
+		t.Errorf("pingArgs args = %v, want the interface's address NOT to appear - -I takes the name directly on Linux", args)
+	}
+}
+
+func TestPingArgsNoInterfacePinnedOmitsBindFlag(t *testing.T) {
+	args := pingArgs("203.0.113.5", 4, 5000, netiface.Interface{})
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "-S") || strings.Contains(joined, "-I") {
+		t.Errorf("pingArgs args = %v, want no -S/-I flag when no interface is pinned", args)
 	}
 }

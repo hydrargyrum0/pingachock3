@@ -157,13 +157,23 @@ func classifyUnreachable(recv int) string {
 // packets, which would otherwise make even a 2-packet probe add a
 // second-plus of latency on every ambiguous TLS failure.
 func diagnosticPingReceived(ctx context.Context, netCfg NetConfig, target string) int {
+	boundIface, err := resolveBoundInterface(netCfg)
+	if err != nil {
+		// The pinned interface is gone - there's no meaningful diagnostic
+		// ping to run either way, and the TLS attempt this is diagnosing
+		// already failed for the same underlying reason. classifyUnreachable
+		// with recv==0 ("ip unreachable") is the closer-to-honest of the two
+		// possible outcomes here, not a real detection either way.
+		return 0
+	}
+
 	const pingCount = 1
 	const pingTimeoutMs = 1500
 	overall := time.Duration(pingTimeoutMs)*time.Millisecond*time.Duration(pingCount) + 3*time.Second
 	cmdCtx, cancel := context.WithTimeout(ctx, overall)
 	defer cancel()
 
-	args := pingArgs(target, pingCount, pingTimeoutMs, netCfg.LocalAddr)
+	args := pingArgs(target, pingCount, pingTimeoutMs, boundIface)
 	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
