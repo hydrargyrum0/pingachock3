@@ -111,12 +111,20 @@ func (p *program) run(ctx context.Context) {
 		p.log.Info("fronted transport configured as fallback", "front_domain", cfg.FrontDomain, "front_real_host", cfg.FrontRealHost)
 	}
 
+	pathTest := &poller.PathSelfTest{
+		Bind:    netCfg.Bind,
+		Targets: []string{"1.1.1.1:443", "8.8.8.8:443"},
+		Log:     p.log,
+	}
+	go pathTest.Run(ctx)
+
 	pl := &poller.Poller{
 		Transport:     tr,
 		Interval:      time.Duration(cfg.PollIntervalSeconds) * time.Second,
 		AgentVersion:  agentVersion,
 		MaxConcurrent: cfg.MaxConcurrentChecks,
 		NetConfig:     netCfg,
+		PathTest:      pathTest,
 		Log:           p.log,
 		StatePath:     agentstate.Path(baseDir),
 	}
