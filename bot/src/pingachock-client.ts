@@ -295,7 +295,14 @@ const CHECK_ERROR_TRANSLATIONS: Record<string, string> = {
   // "connection failed" buckets above, telling apart "whole host is down"
   // from "just this port is filtered, host answers pings fine".
   'ip unreachable': 'IP адрес недоступен (не отвечает на ping)',
-  'port unreachable': 'порт недоступен (хост отвечает на ping)'
+  'port unreachable': 'порт недоступен (хост отвечает на ping)',
+  // A node's operator-pinned interface disappeared mid-check (cable
+  // unplugged, Wi-Fi off, adapter removed) - see
+  // docs/superpowers/specs/2026-08-13-vpn-resilient-node-networking-design.md
+  // Part 3. Distinct wording on purpose: this is an agent/host problem, not
+  // a signal about the target's own reachability, so it shouldn't read like
+  // every check on the node just started failing for censorship reasons.
+  'network interface unavailable': 'сетевой интерфейс узла недоступен (нужно заново запустить configure)'
 };
 
 export function translateCheckError(message: string | null | undefined): string | undefined {

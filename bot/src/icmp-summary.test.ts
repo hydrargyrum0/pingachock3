@@ -62,6 +62,17 @@ test('translateCheckError maps the TLS Handshake ICMP-diagnosis tokens to Russia
   assert.equal(translateCheckError('port unreachable'), 'порт недоступен (хост отвечает на ping)');
 });
 
+// A pinned interface disappearing (internal/netiface.ErrInterfaceUnavailable,
+// surfaced via internal/checks.classifyNetError) is an agent/host problem,
+// not a target-reachability one - distinct wording so an operator doesn't
+// mistake it for every check target suddenly going down at once.
+test('translateCheckError maps the pinned-interface-gone token to Russian', () => {
+  assert.equal(
+    translateCheckError('network interface unavailable'),
+    'сетевой интерфейс узла недоступен (нужно заново запустить configure)'
+  );
+});
+
 test('translateCheckError passes through an unrecognized token unchanged rather than dropping it', () => {
   assert.equal(translateCheckError('some future token'), 'some future token');
 });
