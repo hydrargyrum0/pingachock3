@@ -130,26 +130,39 @@ func (p *program) run(ctx context.Context) {
 }
 
 // buildNetConfig turns the interface/DNS settings picked at setup time into
-// the resolver+dialer checks actually use. See internal/checks.NetConfig.
+// the resolver+dialer checks actually use. See internal/checks.NetConfig
+// and docs/superpowers/specs/2026-08-13-vpn-resilient-node-networking-design.md.
 func buildNetConfig(cfg config.Config) checks.NetConfig {
 	var netCfg checks.NetConfig
-	if cfg.LocalAddr != "" {
+	if cfg.InterfaceName != "" {
+		netCfg.InterfaceName = cfg.InterfaceName
+		netCfg.Bind = netiface.BindControl(cfg.InterfaceName)
+		if ifc, err := netiface.ByName(cfg.InterfaceName); err == nil {
+			netCfg.LocalAddr = ifc.PreferredAddr()
+		}
+		// If ByName fails right now (interface briefly gone at agent
+		// startup, e.g. a Wi-Fi adapter still coming up), LocalAddr just
+		// stays nil - it only ever affects which DNS answer's family gets
+		// picked, a much smaller blast radius than a failed dial. Bind and
+		// InterfaceName above (what actually matters) are unaffected: Bind
+		// re-checks the interface itself on every real dial, and will start
+		// working the moment the interface is actually up, no restart
+		// needed.
+	} else if cfg.LocalAddr != "" {
+		// Back-compat: a config saved by an agent build from before
+		// InterfaceName was read here. Degrades to the old, address-only
+		// behavior (no Control-based binding) rather than losing interface
+		// pinning entirely - operators on an old config still get *some*
+		// protection until they next run `configure`.
 		netCfg.LocalAddr = net.ParseIP(cfg.LocalAddr)
 	}
 	if len(cfg.DNSServers) > 0 {
 		servers := cfg.DNSServers
-		localIP := netCfg.LocalAddr
+		bind := netCfg.Bind
 		netCfg.Resolver = &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				d := net.Dialer{Timeout: 5 * time.Second}
-				if localIP != nil {
-					if strings.HasPrefix(network, "tcp") {
-						d.LocalAddr = &net.TCPAddr{IP: localIP}
-					} else {
-						d.LocalAddr = &net.UDPAddr{IP: localIP}
-					}
-				}
+				d := net.Dialer{Timeout: 5 * time.Second, Control: bind}
 				// First configured server; if it's unreachable the lookup
 				// just fails for that check the way any DNS outage would.
 				return d.DialContext(ctx, network, net.JoinHostPort(servers[0], "53"))
