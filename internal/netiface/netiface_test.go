@@ -1,6 +1,7 @@
 package netiface
 
 import (
+	"errors"
 	"net"
 	"testing"
 )
@@ -47,5 +48,34 @@ func TestInterfacePreferredAddr(t *testing.T) {
 				t.Errorf("PreferredAddr() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestByNameReturnsCurrentState(t *testing.T) {
+	ifaces, err := List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(ifaces) == 0 {
+		t.Skip("no usable network interfaces in this environment")
+	}
+	want := ifaces[0]
+
+	got, err := ByName(want.Name)
+	if err != nil {
+		t.Fatalf("ByName(%q) error = %v", want.Name, err)
+	}
+	if got.Name != want.Name {
+		t.Errorf("ByName(%q).Name = %q, want %q", want.Name, got.Name, want.Name)
+	}
+	if len(got.Addrs) == 0 {
+		t.Errorf("ByName(%q).Addrs is empty, want at least one address", want.Name)
+	}
+}
+
+func TestByNameUnknownInterfaceReturnsErrInterfaceUnavailable(t *testing.T) {
+	_, err := ByName("this-interface-does-not-exist-pingachock-test")
+	if !errors.Is(err, ErrInterfaceUnavailable) {
+		t.Errorf("ByName() error = %v, want errors.Is(err, ErrInterfaceUnavailable)", err)
 	}
 }
