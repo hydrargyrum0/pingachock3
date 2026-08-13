@@ -63,8 +63,8 @@ func (TLSChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 	sni := chooseSNI(target, p.SNI)
 
 	dialer := net.Dialer{
-		Timeout:   timeout,
-		LocalAddr: localAddr("tcp", netCfg.LocalAddr),
+		Timeout: timeout,
+		Control: netCfg.Bind,
 	}
 
 	var attempts, succeeded int

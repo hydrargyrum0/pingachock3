@@ -37,7 +37,7 @@ func (HTTPChecker) Run(ctx context.Context, netCfg NetConfig, target string, raw
 		url = "https://" + url
 	}
 
-	dialer := &net.Dialer{Resolver: netCfg.Resolver, LocalAddr: localAddr("tcp", netCfg.LocalAddr)}
+	dialer := &net.Dialer{Resolver: netCfg.Resolver, Control: netCfg.Bind}
 	client := &http.Client{
 		Timeout:   time.Duration(p.TimeoutMs) * time.Millisecond,
 		Transport: &http.Transport{DialContext: dialer.DialContext},

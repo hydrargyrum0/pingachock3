@@ -12,6 +12,8 @@ import (
 	"net"
 	"syscall"
 	"time"
+
+	"pingachock/internal/netiface"
 )
 
 type Result struct {
@@ -23,14 +25,46 @@ type Result struct {
 }
 
 // NetConfig pins checks to a specific network interface, set by the
-// operator via `configure` (see internal/netiface). LocalAddr is nil and
-// Resolver is nil when no interface was selected - checkers then fall back
-// to whatever the OS/Go default would do, unchanged from before this
-// existed.
+// operator via `configure` (see internal/netiface). Every field is the
+// zero value when no interface was selected - checkers then fall back to
+// whatever the OS/Go default would do, unchanged from before this design
+// existed. See
+// docs/superpowers/specs/2026-08-13-vpn-resilient-node-networking-design.md.
 type NetConfig struct {
+	// LocalAddr is used only as an address-family preference hint when
+	// resolveIP picks among multiple DNS answers (see pickPreferredIP) -
+	// resolved once at agent startup from the pinned interface's address at
+	// that moment. Never used for socket binding directly (see Bind) - this
+	// field staying stale for the life of a long-running agent process is
+	// harmless, since only its address *family* (IPv4 vs IPv6) is ever
+	// consulted, and that's a static property of an interface that doesn't
+	// change just because its specific address does.
 	LocalAddr net.IP
-	Resolver  *net.Resolver
+
+	Resolver *net.Resolver
+
+	// Bind, when set, forces every dial through it to leave via a specific
+	// pinned network interface - not just a specific source address -
+	// re-verified fresh on every single call, so neither a changed address
+	// (DHCP renewal) nor a removed interface needs anything refreshed here.
+	// See internal/netiface's per-OS BindControl. nil means "no interface
+	// pinned" - the OS picks the route the same as always.
+	Bind BindFunc
+
+	// InterfaceName is the pinned interface's name, for the checkers that
+	// can't use Bind directly and need to resolve their own fresh, literal
+	// address right before use instead: PingChecker (shells out to the OS
+	// ping binary) and VLESSChecker (builds an xray-core config's
+	// sendThrough field). See internal/netiface.ByName. Empty means "no
+	// interface pinned."
+	InterfaceName string
 }
+
+// BindFunc is the shape of net.Dialer.Control - named here so
+// internal/netiface's per-OS implementations and internal/poller's
+// PathSelfTest (see the design doc's Part 4) don't each need their own
+// copy of this signature.
+type BindFunc = func(network, address string, c syscall.RawConn) error
 
 type Checker interface {
 	Run(ctx context.Context, netCfg NetConfig, target string, params json.RawMessage) Result
@@ -144,21 +178,18 @@ func pickPreferredIP(ips []net.IPAddr, preferFamily net.IP) net.IP {
 	return ips[0].IP
 }
 
-// localAddr builds the right net.Addr type for the given network ("tcp...",
-// "udp...") - net.Dialer.LocalAddr must match the dial network's address
-// family or the dial fails outright.
-func localAddr(network string, ip net.IP) net.Addr {
-	if ip == nil {
-		return nil
+// resolveBoundInterface returns netCfg's pinned interface's current state,
+// resolved fresh - never cached - for the checkers that shell out to an
+// external tool needing a literal address/interface-name argument
+// (PingChecker, and TLSChecker's own diagnostic ping) rather than being
+// able to use netCfg.Bind's Control-based binding directly. Returns the
+// zero Interface{} with a nil error when no interface is pinned at all -
+// callers should treat that exactly like "unbound", not an error.
+func resolveBoundInterface(netCfg NetConfig) (netiface.Interface, error) {
+	if netCfg.InterfaceName == "" {
+		return netiface.Interface{}, nil
 	}
-	switch {
-	case len(network) >= 3 && network[:3] == "tcp":
-		return &net.TCPAddr{IP: ip}
-	case len(network) >= 3 && network[:3] == "udp":
-		return &net.UDPAddr{IP: ip}
-	default:
-		return &net.IPAddr{IP: ip}
-	}
+	return netiface.ByName(netCfg.InterfaceName)
 }
 
 // classifyNetError maps a connection-level error (TCP dial, TLS handshake)
@@ -173,6 +204,9 @@ func localAddr(network string, ip net.IP) net.Addr {
 func classifyNetError(err error) string {
 	if err == nil {
 		return ""
+	}
+	if errors.Is(err, netiface.ErrInterfaceUnavailable) {
+		return "network interface unavailable"
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timeout"

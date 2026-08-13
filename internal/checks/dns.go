@@ -40,7 +40,7 @@ func (DNSChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 		resolver = &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				d := net.Dialer{Timeout: time.Duration(p.TimeoutMs) * time.Millisecond, LocalAddr: localAddr(network, netCfg.LocalAddr)}
+				d := net.Dialer{Timeout: time.Duration(p.TimeoutMs) * time.Millisecond, Control: netCfg.Bind}
 				return d.DialContext(ctx, network, net.JoinHostPort(p.Resolver, "53"))
 			},
 		}

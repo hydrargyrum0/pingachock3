@@ -34,9 +34,9 @@ func (TCPChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawP
 	probeTarget, reportedIP := resolveIP(ctx, netCfg.Resolver, target, time.Duration(p.TimeoutMs)*time.Millisecond, netCfg.LocalAddr)
 	addr := net.JoinHostPort(probeTarget, strconv.Itoa(p.Port))
 	dialer := net.Dialer{
-		Timeout:   time.Duration(p.TimeoutMs) * time.Millisecond,
-		Resolver:  netCfg.Resolver,
-		LocalAddr: localAddr("tcp", netCfg.LocalAddr),
+		Timeout:  time.Duration(p.TimeoutMs) * time.Millisecond,
+		Resolver: netCfg.Resolver,
+		Control:  netCfg.Bind,
 	}
 
 	raw := map[string]any{"address": addr}

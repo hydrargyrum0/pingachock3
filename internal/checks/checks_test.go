@@ -3,9 +3,12 @@ package checks
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
+
+	"pingachock/internal/netiface"
 )
 
 func TestResolveIPLiteralPassthrough(t *testing.T) {
@@ -111,6 +114,13 @@ func TestClassifyNetError(t *testing.T) {
 				t.Errorf("classifyNetError(%v) = %q, want %q", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestClassifyNetErrorInterfaceUnavailable(t *testing.T) {
+	err := fmt.Errorf("dial tcp: %w: eth-test: interface not found", netiface.ErrInterfaceUnavailable)
+	if got := classifyNetError(err); got != "network interface unavailable" {
+		t.Errorf("classifyNetError(%v) = %q, want %q", err, got, "network interface unavailable")
 	}
 }
 

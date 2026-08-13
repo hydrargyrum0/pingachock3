@@ -64,7 +64,7 @@ func (UpgradeChecker) Run(ctx context.Context, netCfg NetConfig, target string, 
 		raw["resolved_target"] = reportedIP
 	}
 
-	dialer := net.Dialer{Timeout: timeout, LocalAddr: localAddr("tcp", netCfg.LocalAddr)}
+	dialer := net.Dialer{Timeout: timeout, Control: netCfg.Bind}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		msg := classifyNetError(err)
