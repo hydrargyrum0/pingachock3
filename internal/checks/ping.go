@@ -62,7 +62,11 @@ func (PingChecker) Run(ctx context.Context, netCfg NetConfig, target string, raw
 	runErr := cmd.Run()
 	elapsedMs := int(time.Since(start).Milliseconds())
 
-	output := out.String()
+	// decodeConsoleOutput, not out.String(): on Windows, a ping.exe reply's
+	// Cyrillic text arrives as raw OEM-codepage bytes (CP866 on a
+	// Russian-locale install), not UTF-8 - see ping_windows.go's doc
+	// comment for why this isn't optional.
+	output := decodeConsoleOutput(out.Bytes())
 	sent, recv, avgMs := parsePingOutput(output)
 	// Only trust "the stats line just didn't parse" (locale mismatch, see
 	// parsePingOutput) as a reason to assume the full p.Count actually went
