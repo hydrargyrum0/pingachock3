@@ -9,7 +9,7 @@ import (
 
 func TestPatchInboundAddsSocksWhenNoneExists(t *testing.T) {
 	input := json.RawMessage(`{"outbounds":[{"protocol":"vless"}]}`)
-	patched, err := patchInbound(input, 12345)
+	patched, err := patchInbound(input, 12345, "")
 	if err != nil {
 		t.Fatalf("patchInbound() error = %v", err)
 	}
@@ -43,7 +43,7 @@ func TestPatchInboundAddsSocksWhenNoneExists(t *testing.T) {
 
 func TestPatchInboundReplacesExistingInbounds(t *testing.T) {
 	input := json.RawMessage(`{"inbounds":[{"protocol":"http","port":8080}],"outbounds":[{"protocol":"vless"}]}`)
-	patched, err := patchInbound(input, 55555)
+	patched, err := patchInbound(input, 55555, "")
 	if err != nil {
 		t.Fatalf("patchInbound() error = %v", err)
 	}
@@ -77,7 +77,7 @@ func TestPatchInboundOverridesLogConfig(t *testing.T) {
 		"log": {"access": "/private/var/mobile/Containers/Shared/AppGroup/whatever/access.log", "dnsLog": true, "loglevel": "Error"},
 		"outbounds": [{"protocol": "vless"}]
 	}`)
-	patched, err := patchInbound(input, 12345)
+	patched, err := patchInbound(input, 12345, "")
 	if err != nil {
 		t.Fatalf("patchInbound() error = %v", err)
 	}
@@ -100,9 +100,76 @@ func TestPatchInboundOverridesLogConfig(t *testing.T) {
 }
 
 func TestPatchInboundRejectsInvalidJSON(t *testing.T) {
-	_, err := patchInbound(json.RawMessage(`not json`), 1234)
+	_, err := patchInbound(json.RawMessage(`not json`), 1234, "")
 	if err == nil {
 		t.Fatal("patchInbound() error = nil, want an error for invalid JSON")
+	}
+}
+
+// TestPatchInboundSetsSendThroughOnRealOutboundsOnly: xray-core has no
+// interface-identity bind option in its config schema, only a literal
+// source IP via each outbound's sendThrough field - the VLESS equivalent
+// of BindControl's interface pinning. "blackhole" never opens a real
+// connection, so it must not get one.
+func TestPatchInboundSetsSendThroughOnRealOutboundsOnly(t *testing.T) {
+	input := json.RawMessage(`{
+		"outbounds": [
+			{"protocol": "vless", "settings": {}},
+			{"protocol": "freedom", "tag": "direct"},
+			{"protocol": "blackhole", "tag": "block"}
+		]
+	}`)
+	patched, err := patchInbound(input, 12345, "192.168.1.50")
+	if err != nil {
+		t.Fatalf("patchInbound() error = %v", err)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(patched, &doc); err != nil {
+		t.Fatalf("unmarshal patched config: %v", err)
+	}
+	outbounds, ok := doc["outbounds"].([]any)
+	if !ok || len(outbounds) != 3 {
+		t.Fatalf("outbounds = %v, want exactly 3 entries preserved", doc["outbounds"])
+	}
+
+	for _, raw := range outbounds {
+		entry := raw.(map[string]any)
+		protocol := entry["protocol"].(string)
+		sendThrough, has := entry["sendThrough"]
+		if protocol == "blackhole" {
+			if has {
+				t.Errorf("blackhole outbound got sendThrough = %v, want none - it never opens a real connection", sendThrough)
+			}
+			continue
+		}
+		if sendThrough != "192.168.1.50" {
+			t.Errorf("%s outbound sendThrough = %v, want %q", protocol, sendThrough, "192.168.1.50")
+		}
+	}
+}
+
+// TestPatchInboundEmptySendThroughLeavesOutboundsUntouched: an empty
+// sendThrough (no interface pinned - see VLESSChecker.Run) must not add the
+// field at all, not add it as an empty string - an empty sendThrough in a
+// real xray-core config is itself a (harmless but pointless) config
+// oddity, and leaving outbounds completely untouched when there's nothing
+// meaningful to bind to is the more honest behavior.
+func TestPatchInboundEmptySendThroughLeavesOutboundsUntouched(t *testing.T) {
+	input := json.RawMessage(`{"outbounds": [{"protocol": "vless"}]}`)
+	patched, err := patchInbound(input, 12345, "")
+	if err != nil {
+		t.Fatalf("patchInbound() error = %v", err)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(patched, &doc); err != nil {
+		t.Fatalf("unmarshal patched config: %v", err)
+	}
+	outbounds := doc["outbounds"].([]any)
+	entry := outbounds[0].(map[string]any)
+	if _, has := entry["sendThrough"]; has {
+		t.Errorf("outbound got sendThrough = %v with an empty pin, want the field entirely absent", entry["sendThrough"])
 	}
 }
 

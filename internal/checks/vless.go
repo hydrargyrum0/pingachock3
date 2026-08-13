@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"pingachock/internal/netiface"
 	"strconv"
 	"strings"
 	"time"
@@ -65,7 +66,19 @@ func (VLESSChecker) Run(ctx context.Context, netCfg NetConfig, target string, ra
 		return Result{Success: false, ErrorMessage: &msg}
 	}
 
-	patchedConfig, err := patchInbound(p.Config, port)
+	var sendThrough string
+	if netCfg.InterfaceName != "" {
+		ifc, err := netiface.ByName(netCfg.InterfaceName)
+		if err != nil {
+			msg := classifyNetError(err)
+			return Result{Success: false, ErrorMessage: &msg}
+		}
+		if addr := ifc.PreferredAddr(); addr != nil {
+			sendThrough = addr.String()
+		}
+	}
+
+	patchedConfig, err := patchInbound(p.Config, port, sendThrough)
 	if err != nil {
 		msg := "invalid config: " + err.Error()
 		return Result{Success: false, ErrorMessage: &msg}
@@ -153,7 +166,7 @@ func freePort() (int, error) {
 // destinations are meaningless on this node regardless, so this always
 // wins over whatever the caller supplied - loglevel "warning" is enough to
 // still surface genuine config/startup errors on stdout.
-func patchInbound(config json.RawMessage, port int) (json.RawMessage, error) {
+func patchInbound(config json.RawMessage, port int, sendThrough string) (json.RawMessage, error) {
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(config, &doc); err != nil {
 		return nil, fmt.Errorf("not valid JSON: %w", err)
@@ -172,7 +185,42 @@ func patchInbound(config json.RawMessage, port int) (json.RawMessage, error) {
 	doc["inbounds"] = inboundsJSON
 	doc["log"] = json.RawMessage(`{"loglevel":"warning"}`)
 
+	if sendThrough != "" {
+		patched, err := patchOutboundsSendThrough(doc["outbounds"], sendThrough)
+		if err != nil {
+			return nil, fmt.Errorf("outbounds: %w", err)
+		}
+		doc["outbounds"] = patched
+	}
+
 	return json.Marshal(doc)
+}
+
+// patchOutboundsSendThrough forces every outbound that actually performs
+// network egress to bind through sendThrough - the pinned physical
+// interface's current address, resolved fresh right before every check
+// run (see VLESSChecker.Run), never a cached value, for the same
+// staleness reason internal/netiface.BindControl re-verifies its
+// interface on every single call. xray-core has no interface-*identity*
+// bind option in its config schema (only a literal source IP via
+// sendThrough), unlike every other checker's Control-based approach, so
+// this is the closest available equivalent. "blackhole" is explicitly
+// skipped - it never opens a real connection, so it has nothing to bind.
+func patchOutboundsSendThrough(outbounds json.RawMessage, sendThrough string) (json.RawMessage, error) {
+	if len(outbounds) == 0 {
+		return outbounds, nil
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(outbounds, &entries); err != nil {
+		return nil, fmt.Errorf("not a valid outbounds array: %w", err)
+	}
+	for _, entry := range entries {
+		if protocol, _ := entry["protocol"].(string); protocol == "blackhole" {
+			continue
+		}
+		entry["sendThrough"] = sendThrough
+	}
+	return json.Marshal(entries)
 }
 
 func writeTempConfig(config json.RawMessage) (string, error) {
