@@ -100,8 +100,7 @@ func (p *Poller) tick(ctx context.Context) {
 	}
 	sem := make(chan struct{}, maxConcurrent)
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	results := make([]transport.ResultSubmission, 0, len(jobs))
+	resultsCh := make(chan transport.ResultSubmission, len(jobs))
 
 	for _, job := range jobs {
 		wg.Add(1)
@@ -109,17 +108,96 @@ func (p *Poller) tick(ctx context.Context) {
 		go func(job transport.Job) {
 			defer wg.Done()
 			defer func() { <-sem }()
-
-			res := p.execute(ctx, job)
-			mu.Lock()
-			results = append(results, res)
-			mu.Unlock()
+			resultsCh <- p.execute(ctx, job)
 		}(job)
 	}
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		close(resultsCh)
+	}()
 
+	p.streamResults(ctx, resultsCh)
+}
+
+// resultFlushInterval/resultFlushBatchSize bound how long a finished
+// result can sit waiting before streamResults reports it - see
+// streamResults' own doc comment for why this exists at all. Neither
+// value is tuned for a specific batch size; both just need to stay small
+// relative to how long a real check can legitimately take (seconds), so
+// even a large batch's fastest results are reported promptly rather than
+// in lockstep with its slowest one.
+const (
+	resultFlushInterval  = 500 * time.Millisecond
+	resultFlushBatchSize = 10
+)
+
+// streamResults drains resultsCh (closed once every worker goroutine for
+// this tick has finished executing its job) and posts whatever has
+// accumulated periodically, instead of collecting every result and
+// posting them all in one call only after the very last one finishes.
+//
+// That "one call at the very end" design was the actual bug behind a real
+// report: pinging a large batch of addresses at once came back with every
+// single one reported as failed, while the same addresses in smaller
+// batches succeeded. A big batch of check targets routinely includes some
+// that are slow or genuinely unreachable - that's the whole point of a
+// censorship-monitoring tool, not an edge case - and MaxConcurrent
+// throttles how many run at once, so a big batch takes several times
+// longer overall than a small one even before factoring in stragglers.
+// Every other result in that same tick, however fast it personally
+// finished, used to sit done-and-ready but unsent until the single
+// slowest job in the whole tick finally finished too - easily blowing
+// past the bot's own fixed per-check poll timeout
+// (NODE_POLL_TIMEOUT_MS in bot/src/pingachock-client.ts), which then gave
+// up and reported those already-succeeded checks as failed simply because
+// it stopped waiting before the agent got around to telling it otherwise.
+//
+// Flushing periodically instead decouples "how long until this result is
+// reported" from "how many other jobs happen to share this tick and how
+// slow the slowest of them is" - a result is now reported within
+// resultFlushInterval of finishing, full stop, regardless of batch size.
+func (p *Poller) streamResults(ctx context.Context, resultsCh <-chan transport.ResultSubmission) {
+	ticker := time.NewTicker(resultFlushInterval)
+	defer ticker.Stop()
+
+	var pending []transport.ResultSubmission
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		batch := pending
+		pending = nil
+		p.postBatch(ctx, batch)
+	}
+
+	for {
+		select {
+		case res, ok := <-resultsCh:
+			if !ok {
+				flush()
+				return
+			}
+			pending = append(pending, res)
+			if len(pending) >= resultFlushBatchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+// postBatch is tick's old end-of-run submission logic, unchanged in
+// substance (same withhold check, same success/failure logging and
+// state-saving) - just now called once per flush instead of once per
+// tick, so a busy tick logs one "results sent" line per batch actually
+// sent rather than a single line for the whole tick. That's a more
+// accurate reflection of what happened, not a loss of information: for
+// the common case of a small tick that fits in one flush, the log output
+// is identical to before.
+func (p *Poller) postBatch(ctx context.Context, results []transport.ResultSubmission) {
 	if p.PathTest != nil && p.PathTest.Suspect() {
-		p.Log.Warn("withholding this tick's results - path self-test currently suspects VPN/proxy interception", "count", len(results))
+		p.Log.Warn("withholding a batch of results - path self-test currently suspects VPN/proxy interception", "count", len(results))
 		return
 	}
 

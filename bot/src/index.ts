@@ -90,7 +90,7 @@ function parseAdminIds(raw: string): Set<string> {
 const ADMIN_IDS = parseAdminIds(ADMIN_CHAT_IDS_RAW);
 
 // handlerTimeout default is 90_000ms (telegraf's own default) - raised with
-// headroom above pingachock-client's NODE_POLL_TIMEOUT_MS (60_000ms, see
+// headroom above pingachock-client's NODE_POLL_TIMEOUT_MS (100_000ms, see
 // pingachock-client.ts) so a legitimately slow node-routed ping always
 // resolves through our own code path (and gets reported to the user via the
 // normal try/catch) well before telegraf's watchdog could ever fire.

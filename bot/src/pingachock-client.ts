@@ -191,7 +191,19 @@ const NODE_POLL_INTERVAL_MS = 2000;
 // it crashed the whole bot for every user over one slow ping (telegraf's
 // default error handler re-throws - see the bot.catch() comment in
 // index.ts). See docs/superpowers/specs/2026-07-19-telegram-bot-merge-design.md.
-const NODE_POLL_TIMEOUT_MS = 60000;
+//
+// Raised from 60_000 to 100_000 (still a healthy 20s under the 120_000
+// ceiling) alongside internal/poller streaming results back per-check
+// instead of once per whole tick (see poller.go's streamResults) - a
+// large batch's slowest straggler used to make this deadline the actual
+// cause of "big batches come back failed, small ones succeed" (a real
+// user report), since not even the fast checks in that batch got
+// reported until the slow one finished too. Streaming fixes the typical
+// case on its own; this extra margin is defense-in-depth for a very large
+// batch, where a check queued behind MaxConcurrent's limit can still take
+// a while just to get a turn to run at all, independent of how promptly
+// results get reported once it does.
+const NODE_POLL_TIMEOUT_MS = 100000;
 
 type CheckSpec = { kind: 'icmp' } | { kind: 'port'; port: string };
 
