@@ -27,16 +27,40 @@ type pingParams struct {
 	TimeoutMs int `json:"timeout_ms"`
 }
 
+// defaultPingCount/defaultPingTimeoutMs are pingParams' zero-value
+// fallbacks - named so DefaultPingWorstCase below can share them instead
+// of re-deriving the same 4-pings/5s-each shape as a second, driftable
+// magic number.
+const (
+	defaultPingCount     = 4
+	defaultPingTimeoutMs = 5000
+)
+
+// DefaultPingWorstCase is how long Run's own cmdCtx timeout (see overall,
+// below) allows a single default-params ping check to run before giving
+// up - i.e. the longest one unreachable target can legitimately take.
+// Exported so callers outside this package can reason about it without
+// duplicating the formula: see internal/config's
+// TestDefaultMaxConcurrentChecksKeepsRealisticBatchUnderBotDeadline, which
+// uses it to prove MaxConcurrentChecks' default stays large enough that a
+// realistic large batch of targets - this app's normal workload, not an
+// edge case, see streamResults' doc comment in internal/poller/poller.go -
+// finishes within the bot's own poll deadline
+// (NODE_POLL_TIMEOUT_MS in bot/src/pingachock-client.ts).
+func DefaultPingWorstCase() time.Duration {
+	return time.Duration(defaultPingTimeoutMs)*time.Millisecond*time.Duration(defaultPingCount) + 5*time.Second
+}
+
 func (PingChecker) Run(ctx context.Context, netCfg NetConfig, target string, rawParams json.RawMessage) Result {
 	var p pingParams
 	if len(rawParams) > 0 {
 		_ = json.Unmarshal(rawParams, &p)
 	}
 	if p.Count <= 0 {
-		p.Count = 4
+		p.Count = defaultPingCount
 	}
 	if p.TimeoutMs <= 0 {
-		p.TimeoutMs = 5000
+		p.TimeoutMs = defaultPingTimeoutMs
 	}
 
 	boundIface, err := resolveBoundInterface(netCfg)

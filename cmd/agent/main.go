@@ -965,11 +965,18 @@ func resolveConfig(configPath string, f setupFlags) (config.Config, error) {
 	cfg.LocalAddr = selected.PreferredAddr().String()
 	cfg.DNSServers = dnsServers
 
+	// Both defaults, including the "still on the pre-fix stock value"
+	// check, mirror config.Load's own logic exactly (see that function's
+	// doc comments for why the latter check exists at all) - so
+	// re-running `configure` on an already-configured node also
+	// normalizes an old agent.json back to matching what's actually
+	// running, instead of leaving a stale 10 on disk that Load() would
+	// keep silently overriding forever.
 	if cfg.PollIntervalSeconds <= 0 {
-		cfg.PollIntervalSeconds = 30
+		cfg.PollIntervalSeconds = config.DefaultPollIntervalSeconds
 	}
-	if cfg.MaxConcurrentChecks <= 0 {
-		cfg.MaxConcurrentChecks = 10
+	if cfg.MaxConcurrentChecks <= 0 || cfg.MaxConcurrentChecks == config.HistoricalMaxConcurrentChecksDefault {
+		cfg.MaxConcurrentChecks = config.DefaultMaxConcurrentChecks
 	}
 
 	return cfg, nil
