@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { Markup, Telegraf, session, type Context } from 'telegraf';
 import { settingsRepo, userRepo } from './db';
 import * as apiClient from './pingachock-client';
-import type { Router, PendingFollowUp } from './pingachock-client';
+import type { Router } from './pingachock-client';
 
 type MySession = {
   awaitingAddUser?: boolean;
@@ -1341,44 +1341,67 @@ function formatPingReport(params: {
   return `${headerLines.join('\n')}\n\n${lines.join('\n')}`.trim();
 }
 
-// PENDING_FOLLOWUP_TIMEOUT_MS bounds the *second* pass over whatever
-// checks were still pending/running when the main ping report already had
-// to go out - see pingachock-client.ts's mergeNodeResults doc comment for
-// the full two-pass story this is one half of. Unlike NODE_POLL_TIMEOUT_MS,
-// this isn't bound by Telegraf's handlerTimeout at all: sendPendingFollowUps
-// fires it without awaiting, after the initial reply has already gone out,
-// so it can afford real patience for a large batch or an underpowered node
-// instead of gambling that some fixed number is "big enough" - 5 minutes,
-// not tuned to any specific hardware, just generous.
-const PENDING_FOLLOWUP_TIMEOUT_MS = 5 * 60 * 1000;
-
-// sendPendingFollowUps kicks off the second pass for every router that had
-// anything still pending after the first - deliberately not awaited by the
-// caller (see PENDING_FOLLOWUP_TIMEOUT_MS above for why). Each entry
-// independently sends its own follow-up message to this same chat once
-// (if) its checks actually finish; one that never resolves at all (network
-// dropped, process restarted) just never sends a follow-up rather than
-// blocking anything else - already strictly better than the false "failed"
-// this replaces, so erring toward silence on the failure path here is fine.
-function sendPendingFollowUps(
-  ctx: MyContext,
-  followUps: Array<{ routerLabel: string; followUp: PendingFollowUp }>,
-  checkPortsValue: string
-): void {
-  for (const { routerLabel, followUp } of followUps) {
-    void apiClient
-      .awaitPendingFollowUp(followUp, PENDING_FOLLOWUP_TIMEOUT_MS)
-      .then(async (extra) => {
-        if (extra.length === 0) return;
-        const allowedPortsOrder = parseRequestedPorts(checkPortsValue);
-        const allowedPorts = new Set(allowedPortsOrder);
-        const lines = extra.map((r) => formatPingResultLine(r, { allowedPorts, allowedPortsOrder }));
-        await ctx.reply(`🔁 Довыполнено (${routerLabel}) — были в ожидании:\n\n${lines.join('\n')}`);
-      })
-      .catch((err) => {
-        console.error('pending ping follow-up failed', err);
-      });
+// formatScanProgressText is the /ping command's live-updating progress
+// message body (see the handler below, and pingachock-client.ts's
+// runTrackedNodeScan) - progress is null only before the first tick lands
+// (dispatch itself can take a moment for a big scan), in which case there's
+// nothing to divide by yet so it just shows the target count and elapsed
+// time without a done/total line.
+function formatScanProgressText(totalTargets: number, progress: { done: number; total: number } | null, elapsedMs: number): string {
+  const elapsedSec = Math.round(elapsedMs / 1000);
+  if (!progress || progress.total === 0) {
+    return `⏳ Запрос обрабатывается... (${totalTargets} целей)\nПрошло: ${elapsedSec} сек`;
   }
+  return `⏳ Запрос обрабатывается...\nПроверено ${progress.done}/${progress.total}\nПрошло: ${elapsedSec} сек`;
+}
+
+// editProgressMessage is every progress tick's actual Telegram call -
+// skips the edit entirely when the text hasn't changed since the last one
+// (two ticks computing the same "12/50" between real state changes is
+// normal, and Telegram's API itself errors on a no-op edit) and swallows
+// "message is not modified" specifically (a benign race against that same
+// dedup check under concurrent onProgress calls in ALL mode) while still
+// logging anything else - a progress update that silently stops is a much
+// smaller problem than the scan itself failing, so this never throws.
+async function editProgressMessage(
+  ctx: MyContext,
+  chatId: number,
+  messageId: number,
+  text: string,
+  lastText: { current: string }
+): Promise<void> {
+  if (text === lastText.current) return;
+  lastText.current = text;
+  try {
+    await (ctx as any).telegram.editMessageText(chatId, messageId, undefined, text);
+  } catch (err: any) {
+    const msg = String(err?.message ?? err);
+    if (!msg.includes('message is not modified')) {
+      console.error('failed to edit ping progress message', err);
+    }
+  }
+}
+
+// finishWithReport turns the live progress message into the finished
+// report - editing it in place when the text fits, or editing it into a
+// short "done, see attachment" note and sending the full report as a file
+// otherwise (same TELEGRAM_SAFE_TEXT_LIMIT threshold the old one-shot flow
+// already used).
+async function finishWithReport(
+  ctx: MyContext,
+  chatId: number,
+  progressMessageId: number,
+  lastProgressText: { current: string },
+  executedAt: Date,
+  reportText: string
+): Promise<void> {
+  if (reportText.length > TELEGRAM_SAFE_TEXT_LIMIT) {
+    await editProgressMessage(ctx, chatId, progressMessageId, '✅ Готово, отчёт во вложении', lastProgressText);
+    const filename = `${safeFilenameDate(executedAt)}.txt`;
+    await (ctx as any).replyWithDocument({ source: Buffer.from(reportText, 'utf8'), filename });
+    return;
+  }
+  await editProgressMessage(ctx, chatId, progressMessageId, reportText, lastProgressText);
 }
 
 function chunkText(text: string, chunkSize: number = TELEGRAM_SAFE_TEXT_LIMIT): string[] {
@@ -2401,30 +2424,60 @@ bot.on('text', async (ctx, next) => {
 
     const targets = parsed.targets;
     const totalTargets = targets.length;
-    const batches = chunkArray(targets, 100);
 
     const routerOpt = getPingRouterOption(ctx.session);
     const portsOpt = getPingPortsOption(ctx.session);
+    const { icmp, ports } = apiClient.parseCheckPorts(portsOpt.value);
 
     ctx.session.awaitingPingInput = false;
-    await ctx.reply(`⏳ Выполняю ping... (${totalTargets} целей)`);
+
+    // One message, live-updated in place instead of blocking the handler
+    // until the whole scan finishes - see runOneRouterScan below and
+    // pingachock-client.ts's runTrackedNodeScan for why: no fixed poll
+    // budget can ever be "big enough" for an arbitrarily large batch on an
+    // arbitrarily slow node, and the old synchronous-then-one-final-message
+    // shape had no way to show progress even when it *did* finish in time.
+    const progressMessage = await ctx.reply(formatScanProgressText(totalTargets, null, 0));
+    const chatId = (ctx as any).chat.id;
+    const progressMessageId = (progressMessage as any).message_id;
+    const lastProgressText = { current: '' };
+    const updateProgressMessage = (text: string) => {
+      void editProgressMessage(ctx, chatId, progressMessageId, text, lastProgressText);
+    };
 
     const executedAt = new Date();
 
-    const runPingBatches = async (routerName: string): Promise<{ results: any[]; pendingFollowUps: PendingFollowUp[] }> => {
-      const results: any[] = [];
-      const pendingFollowUps: PendingFollowUp[] = [];
-      for (const batch of batches) {
-        const ip_pool = batch.join(',');
-        const data = await apiClient.ping({ ip_pool, router_name: routerName, check_ports: portsOpt.value });
-        if (data && typeof data === 'object' && Array.isArray((data as any).results)) {
-          results.push(...(data as any).results);
+    // serverRouterMaxTargets mirrors internal/api/public/serverping.go's
+    // serverPingMaxTargets (50) - the old chunkArray(targets, 100) here
+    // didn't actually match that cap, so a >50-target "server" scan could
+    // 400 on any chunk past the first 50; fixed while touching this code
+    // anyway, not a separate change.
+    const serverRouterMaxTargets = 50;
+
+    // runOneRouterScan is one router's whole contribution to the final
+    // report: 'server' keeps using the old synchronous, fast
+    // /api/v1/server-ping path (capped, single deadline, no wave
+    // bottleneck to begin with - see that handler's own doc comment) -
+    // anything else goes through runTrackedNodeScan, reporting progress via
+    // onProgress as it goes.
+    const runOneRouterScan = async (
+      routerName: string,
+      onProgress: (progress: { done: number; total: number }, elapsedMs: number) => void
+    ): Promise<{ label: string; results: any[] }> => {
+      if (routerName === 'server') {
+        const results: any[] = [];
+        for (const chunk of chunkArray(targets, serverRouterMaxTargets)) {
+          const data = await apiClient.ping({ ip_pool: chunk.join(','), router_name: routerName, check_ports: portsOpt.value });
+          if (data && typeof data === 'object' && Array.isArray((data as any).results)) {
+            results.push(...(data as any).results);
+          }
         }
-        if (data && typeof data === 'object' && (data as any).pendingFollowUp) {
-          pendingFollowUps.push((data as any).pendingFollowUp);
-        }
+        return { label: routerName, results };
       }
-      return { results, pendingFollowUps };
+
+      const { id: nodeId, name: resolvedName } = await apiClient.resolveNodeId(routerName);
+      const scan = await apiClient.runTrackedNodeScan({ targets, nodeId, routerName: resolvedName, icmp, ports, onProgress });
+      return { label: resolvedName, results: scan.results };
     };
 
     try {
@@ -2436,62 +2489,61 @@ bot.on('text', async (ctx, next) => {
           return;
         }
 
-        const sections: string[] = [];
-        const allFollowUps: Array<{ routerLabel: string; followUp: PendingFollowUp }> = [];
-        for (const name of routerNames) {
-          const { results, pendingFollowUps } = await runPingBatches(name);
-          for (const followUp of pendingFollowUps) allFollowUps.push({ routerLabel: name, followUp });
-          sections.push(
-            `=== ${name} ===\n` +
+        // One combined counter across every router's scan, all running
+        // concurrently (a real improvement over the old one-router-at-a-time
+        // loop, not just a side effect of the rewrite) - each router
+        // updates its own slot, updateProgressMessage always renders the sum.
+        const startedAt = Date.now();
+        const perRouterProgress = new Map<string, { done: number; total: number }>();
+        const reportCombinedProgress = () => {
+          const combined = [...perRouterProgress.values()].reduce(
+            (acc, p) => ({ done: acc.done + p.done, total: acc.total + p.total }),
+            { done: 0, total: 0 }
+          );
+          updateProgressMessage(formatScanProgressText(totalTargets * routerNames.length, combined, Date.now() - startedAt));
+        };
+
+        const perRouter = await Promise.all(
+          routerNames.map((name) =>
+            runOneRouterScan(name, (progress) => {
+              perRouterProgress.set(name, progress);
+              reportCombinedProgress();
+            })
+          )
+        );
+
+        const reportText = perRouter
+          .map(
+            ({ label, results }) =>
+              `=== ${label} ===\n` +
               formatPingReport({
                 executedAt,
-                routerLabel: name,
+                routerLabel: label,
                 checkPortsLabel: portsOpt.label,
                 checkPortsValue: portsOpt.value,
                 targetsCount: totalTargets,
                 results
               })
-          );
-        }
+          )
+          .join('\n\n');
 
-        const reportText = sections.join('\n\n');
-
-        const sendAsFile = reportText.length > TELEGRAM_SAFE_TEXT_LIMIT;
-        if (sendAsFile) {
-          const filename = `${safeFilenameDate(executedAt)}.txt`;
-          await (ctx as any).replyWithDocument({ source: Buffer.from(reportText, 'utf8'), filename });
-        } else {
-          await ctx.reply(reportText);
-        }
-
-        sendPendingFollowUps(ctx, allFollowUps, portsOpt.value);
+        await finishWithReport(ctx, chatId, progressMessageId, lastProgressText, executedAt, reportText);
       } else {
-        const routerName = routerOpt.value;
-        const { results, pendingFollowUps } = await runPingBatches(routerName);
+        const { label, results } = await runOneRouterScan(routerOpt.value, (progress, elapsedMs) => {
+          updateProgressMessage(formatScanProgressText(totalTargets, progress, elapsedMs));
+        });
         const reportText =
-          `=== ${routerName} ===\n` +
+          `=== ${label} ===\n` +
           formatPingReport({
             executedAt,
-            routerLabel: routerName,
+            routerLabel: label,
             checkPortsLabel: portsOpt.label,
             checkPortsValue: portsOpt.value,
             targetsCount: totalTargets,
             results
           });
 
-        const sendAsFile = reportText.length > TELEGRAM_SAFE_TEXT_LIMIT;
-        if (sendAsFile) {
-          const filename = `${safeFilenameDate(executedAt)}.txt`;
-          await (ctx as any).replyWithDocument({ source: Buffer.from(reportText, 'utf8'), filename });
-        } else {
-          await ctx.reply(reportText);
-        }
-
-        sendPendingFollowUps(
-          ctx,
-          pendingFollowUps.map((followUp) => ({ routerLabel: routerName, followUp })),
-          portsOpt.value
-        );
+        await finishWithReport(ctx, chatId, progressMessageId, lastProgressText, executedAt, reportText);
       }
 
       await ctx.reply('Вы в главном меню', mainMenuKeyboard());

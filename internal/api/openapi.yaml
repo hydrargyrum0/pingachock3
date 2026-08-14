@@ -84,6 +84,13 @@ paths:
         - name: offset
           in: query
           schema: { type: integer, default: 0 }
+        - name: expand
+          in: query
+          description: >-
+            `runs` - добавить детализацию по каждому узлу для каждого чека на
+            странице (один bulk-запрос на всю страницу, не по одному на чек) -
+            тот же смысл, что у expand в GET /checks/{id}.
+          schema: { type: string, enum: [runs] }
       responses:
         '200':
           description: Список чеков

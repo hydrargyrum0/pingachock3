@@ -120,7 +120,7 @@ export async function blockRouter(id: string): Promise<void> {
   await fetchWithAuth(`/api/v1/nodes/${id}`, 'PUT', { blocked: true }, 'admin');
 }
 
-function parseCheckPorts(checkPorts: string): { icmp: boolean; ports: string[] } {
+export function parseCheckPorts(checkPorts: string): { icmp: boolean; ports: string[] } {
   const tokens = checkPorts
     .split(',')
     .map((t) => t.trim())
@@ -149,7 +149,11 @@ export function pickAutoRouter(routers: Router[]): Router | null {
   return routers.find((r) => r.status === 'online' && !r.blocked && !r.is_virtual) ?? null;
 }
 
-async function resolveNodeId(routerName: string): Promise<{ id: string; name: string }> {
+// resolveNodeId is exported so index.ts's tracked-scan flow
+// (runTrackedNodeScan needs an already-resolved nodeId, not a router name)
+// can resolve once up front, the same way ping()'s own node-routed branch
+// below already does internally.
+export async function resolveNodeId(routerName: string): Promise<{ id: string; name: string }> {
   const routers = await listRouters();
   if (routerName === 'auto') {
     const online = pickAutoRouter(routers);
@@ -207,16 +211,22 @@ const NODE_POLL_TIMEOUT_MS = 100000;
 
 type CheckSpec = { kind: 'icmp' } | { kind: 'port'; port: string };
 
-async function createBatchedCheck(spec: CheckSpec, targets: string[], nodeId: string): Promise<string[]> {
+// createBatchedCheck also hands back batchId (null whenever the backend
+// didn't assign one - only happens for a single-target dispatch, since
+// CreateCheck only sets batch_id when len(targets) > 1) so callers that
+// need batch-level progress (runTrackedNodeScan, below) don't have to
+// re-derive it - nodePing itself only ever needed checkIds and keeps
+// ignoring batchId.
+async function createBatchedCheck(spec: CheckSpec, targets: string[], nodeId: string): Promise<{ batchId: string | null; checkIds: string[] }> {
   const body =
     spec.kind === 'icmp'
       ? { type: 'ping', targets, node_selector: { node_ids: [nodeId] } }
       : { type: 'tcp', targets, params: { port: Number(spec.port) }, node_selector: { node_ids: [nodeId] } };
   const created = (await fetchWithAuth('/api/v1/checks', 'POST', body, 'api')) as any;
   if (created.batch_id) {
-    return created.checks.map((c: any) => c.id);
+    return { batchId: String(created.batch_id), checkIds: created.checks.map((c: any) => String(c.id)) };
   }
-  return [created.id];
+  return { batchId: null, checkIds: [String(created.id)] };
 }
 
 // isCheckStillPending mirrors pollCheckUntilDone's own terminal-status
@@ -453,7 +463,7 @@ async function nodePing(
   if (specs.length === 0) return { results: [] };
 
   const dispatched = await Promise.all(
-    specs.map(async (spec) => ({ spec, checkIds: await createBatchedCheck(spec, targets, nodeId) }))
+    specs.map(async (spec) => ({ spec, checkIds: (await createBatchedCheck(spec, targets, nodeId)).checkIds }))
   );
 
   const finished = await Promise.all(
@@ -505,6 +515,186 @@ export async function awaitPendingFollowUp(followUp: PendingFollowUp, timeoutMs:
 
   const targets = [...new Set(items.map((i) => i.target))];
   return mergeNodeResults(targets, nodeId, routerName, [...grouped.values()], true);
+}
+
+// --- Tracked node scans (live progress instead of a fixed poll budget) ---
+//
+// nodePing/ping above dispatch, then block until every check is done or a
+// per-call timeout gives up - fine for the bot's other, smaller
+// apiClient.ping() call sites (periodic health checks etc., left
+// untouched), wrong for the interactive /ping command's own large scans:
+// no fixed timeout is ever really "big enough" for an arbitrarily large
+// subnet on an arbitrarily slow node (see mergeNodeResults' own doc
+// comment), and there was no way to show progress while it ran anyway.
+// runTrackedNodeScan below is index.ts's real fix for that: dispatch once,
+// poll cheap *batch-level* progress on its own schedule (no per-check HTTP
+// calls at all - see the N+1 problem this avoids in
+// internal/store/results.go's ListRunsForChecks doc comment), report it
+// via onProgress, and only fetch full results once, in bulk, at the end.
+
+// DISPATCH_CHUNK_SIZE mirrors ListChecksFilter's own 200-row page cap
+// (internal/store/checks.go) - one progress "page" per dispatched chunk.
+// DISPATCH_CONCURRENCY bounds how many POST /api/v1/checks calls run at
+// once: firing all of them simultaneously for a huge scan would just move
+// the bottleneck from "one slow sequential loop" (the old behavior) to "a
+// thundering herd hitting the backend at once" instead of fixing anything.
+const DISPATCH_CHUNK_SIZE = 200;
+const DISPATCH_CONCURRENCY = 4;
+
+// SCAN_PROGRESS_POLL_INTERVAL_MS is how often runTrackedNodeScan checks in
+// on progress (and index.ts, in turn, edits the Telegram message) - well
+// under Telegram's rate limits for editing one message repeatedly.
+// SCAN_OVERALL_CEILING_MS is the one fixed budget this whole scheme still
+// has, deliberately generous (30 real minutes, not tuned to any specific
+// batch size or node speed) rather than tight like the old
+// NODE_POLL_TIMEOUT_MS - whatever's still open when it's hit gets
+// mergeNodeResults' finalAttempt=true treatment, same as
+// awaitPendingFollowUp's own final pass.
+export const SCAN_PROGRESS_POLL_INTERVAL_MS = 5000;
+export const SCAN_OVERALL_CEILING_MS = 30 * 60 * 1000;
+
+export function chunkTargets<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+// runWithConcurrency runs `items` through `worker` with at most `limit` in
+// flight at once, preserving input order in the returned array regardless
+// of which one finishes first.
+export async function runWithConcurrency<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function runNext(): Promise<void> {
+    const i = next++;
+    if (i >= items.length) return;
+    results[i] = await worker(items[i]);
+    return runNext();
+  }
+  const workers = Array.from({ length: Math.min(Math.max(limit, 1), items.length) }, () => runNext());
+  await Promise.all(workers);
+  return results;
+}
+
+type DispatchedChunk = { spec: CheckSpec; batchId: string | null; checkIds: string[] };
+
+export type ScanProgress = { done: number; total: number };
+
+// aggregateScanProgress is the pure reducer behind fetchScanProgress below
+// - split out so the "sum done/total across however many chunks a big
+// scan needed" math is unit-testable without any network involved.
+export function aggregateScanProgress(perChunk: ScanProgress[]): ScanProgress {
+  return perChunk.reduce((acc, p) => ({ done: acc.done + p.done, total: acc.total + p.total }), { done: 0, total: 0 });
+}
+
+// fetchChunkProgress costs one paginated ListChecks read per
+// DISPATCH_CHUNK_SIZE checks (i.e. one call per chunk, almost always -
+// see DISPATCH_CHUNK_SIZE's own comment), not one per check. The
+// batchId === null branch is the single-target-dispatch edge case
+// (createBatchedCheck's own doc comment) - one direct GET for that one
+// check, never a batch_id filter that wouldn't exist for it.
+async function fetchChunkProgress(chunk: DispatchedChunk): Promise<ScanProgress> {
+  const total = chunk.checkIds.length;
+  if (!chunk.batchId) {
+    const check = (await fetchWithAuth(`/api/v1/checks/${chunk.checkIds[0]}`, 'GET', undefined, 'api')) as any;
+    return { done: isCheckStillPending(check) ? 0 : 1, total: 1 };
+  }
+
+  let done = 0;
+  let offset = 0;
+  for (;;) {
+    const page = (await fetchWithAuth(
+      `/api/v1/checks?batch_id=${encodeURIComponent(chunk.batchId)}&limit=${DISPATCH_CHUNK_SIZE}&offset=${offset}`,
+      'GET',
+      undefined,
+      'api'
+    )) as any;
+    const rows: any[] = Array.isArray(page?.checks) ? page.checks : [];
+    for (const c of rows) {
+      if (!isCheckStillPending(c)) done++;
+    }
+    if (rows.length < DISPATCH_CHUNK_SIZE) break;
+    offset += DISPATCH_CHUNK_SIZE;
+  }
+  return { done, total };
+}
+
+// fetchChunkChecksWithRuns is fetchChunkProgress's counterpart for the
+// final, one-time full-result fetch - same pagination, expand=runs this
+// time (see internal/store/results.go's ListRunsForChecks doc comment for
+// why that's one bulk query server-side too, not an N+1).
+async function fetchChunkChecksWithRuns(chunk: DispatchedChunk): Promise<any[]> {
+  if (!chunk.batchId) {
+    const check = await fetchWithAuth(`/api/v1/checks/${chunk.checkIds[0]}?expand=runs`, 'GET', undefined, 'api');
+    return [check];
+  }
+
+  const out: any[] = [];
+  let offset = 0;
+  for (;;) {
+    const page = (await fetchWithAuth(
+      `/api/v1/checks?batch_id=${encodeURIComponent(chunk.batchId)}&limit=${DISPATCH_CHUNK_SIZE}&offset=${offset}&expand=runs`,
+      'GET',
+      undefined,
+      'api'
+    )) as any;
+    const rows: any[] = Array.isArray(page?.checks) ? page.checks : [];
+    out.push(...rows);
+    if (rows.length < DISPATCH_CHUNK_SIZE) break;
+    offset += DISPATCH_CHUNK_SIZE;
+  }
+  return out;
+}
+
+// runTrackedNodeScan is the /ping command's real dispatch path now (see
+// this section's own intro comment). Never rejects on a slow/large batch -
+// the only way it stops early is SCAN_OVERALL_CEILING_MS, and even then it
+// still returns a full result set (mergeNodeResults' finalAttempt=true for
+// whatever's still open), never throws just because something was slow.
+export async function runTrackedNodeScan(params: {
+  targets: string[];
+  nodeId: string;
+  routerName: string;
+  icmp: boolean;
+  ports: string[];
+  onProgress?: (progress: ScanProgress, elapsedMs: number) => void;
+}): Promise<{ results: any[] }> {
+  const { targets, nodeId, routerName, icmp, ports, onProgress } = params;
+  const specs: CheckSpec[] = [...(icmp ? [{ kind: 'icmp' as const }] : []), ...ports.map((port) => ({ kind: 'port' as const, port }))];
+  if (specs.length === 0 || targets.length === 0) return { results: [] };
+
+  const dispatchJobs = specs.flatMap((spec) => chunkTargets(targets, DISPATCH_CHUNK_SIZE).map((chunkOfTargets) => ({ spec, chunkOfTargets })));
+  const chunks = await runWithConcurrency(dispatchJobs, DISPATCH_CONCURRENCY, async (job) => {
+    const { batchId, checkIds } = await createBatchedCheck(job.spec, job.chunkOfTargets, nodeId);
+    return { spec: job.spec, batchId, checkIds } as DispatchedChunk;
+  });
+
+  const startedAt = Date.now();
+  let ceilingHit = false;
+  for (;;) {
+    const perChunk = await Promise.all(chunks.map(fetchChunkProgress));
+    const progress = aggregateScanProgress(perChunk);
+    onProgress?.(progress, Date.now() - startedAt);
+    if (progress.total === 0 || progress.done >= progress.total) break;
+    if (Date.now() - startedAt > SCAN_OVERALL_CEILING_MS) {
+      ceilingHit = true;
+      break;
+    }
+    await sleep(SCAN_PROGRESS_POLL_INTERVAL_MS);
+  }
+
+  const perChunkChecks = await Promise.all(chunks.map(fetchChunkChecksWithRuns));
+  const grouped = new Map<string, { spec: CheckSpec; checks: any[] }>();
+  chunks.forEach((chunk, i) => {
+    const key = specKey(chunk.spec);
+    const group = grouped.get(key) ?? { spec: chunk.spec, checks: [] };
+    group.checks.push(...perChunkChecks[i]);
+    grouped.set(key, group);
+  });
+
+  return { results: mergeNodeResults(targets, nodeId, routerName, [...grouped.values()], ceilingHit) };
 }
 
 // ping mirrors the old astroping API's GET /api/ping contract exactly

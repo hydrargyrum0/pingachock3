@@ -250,6 +250,33 @@ func (h *Handler) ListChecks(w http.ResponseWriter, r *http.Request) {
 	for i, c := range checks {
 		out[i] = toCheckResponse(c)
 	}
+
+	// expand=runs mirrors GetCheck's own param (see its own handler above)
+	// - one bulk ListRunsForChecks call for the whole page, not one
+	// ListRunsForCheck call per row, so a big ?batch_id=...&expand=runs
+	// page (bot/src/pingachock-client.ts's fetchBatchResults, used once a
+	// tracked scan finishes) costs one query, not up to Limit's own
+	// 200-row cap worth of them. See ListRunsForChecks' own doc comment
+	// (internal/store/results.go) for the full story this exists to fix.
+	if q.Get("expand") == "runs" && len(checks) > 0 {
+		ids := make([]uuid.UUID, len(checks))
+		for i, c := range checks {
+			ids[i] = c.ID
+		}
+		runsByCheck, err := h.Store.ListRunsForChecks(r.Context(), ids)
+		if err != nil {
+			api.WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for i, c := range checks {
+			runs := runsByCheck[c.ID]
+			out[i].Runs = make([]runResponse, len(runs))
+			for j, rw := range runs {
+				out[i].Runs[j] = toRunResponse(rw)
+			}
+		}
+	}
+
 	api.WriteJSON(w, http.StatusOK, map[string]any{"checks": out})
 }
 
