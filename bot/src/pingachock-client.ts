@@ -219,6 +219,19 @@ async function createBatchedCheck(spec: CheckSpec, targets: string[], nodeId: st
   return [created.id];
 }
 
+// isCheckStillPending mirrors pollCheckUntilDone's own terminal-status
+// check (status !== 'pending' && status !== 'running') - pulled out so
+// mergeNodeResults can tell "this check genuinely finished with no result"
+// (shouldn't normally happen, but see its own fallback) apart from "we
+// stopped waiting on it while the agent was still working" - the two used
+// to collapse into the same "no reply"/"closed" rendering, which is what
+// made a slow-but-working node's checks look identical to genuinely dead
+// ones. See mergeNodeResults' own doc comment for the full story.
+function isCheckStillPending(check: any): boolean {
+  const status = check?.status;
+  return status === 'pending' || status === 'running';
+}
+
 async function pollCheckUntilDone(checkId: string, timeoutMs: number = NODE_POLL_TIMEOUT_MS): Promise<any> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -230,18 +243,45 @@ async function pollCheckUntilDone(checkId: string, timeoutMs: number = NODE_POLL
   }
 }
 
-function mergeNodeResults(
+// mergeNodeResults' finalAttempt controls what a target whose check is
+// still pending/running when we stop waiting on it renders as - see
+// PendingFollowUp/awaitPendingFollowUp below for the two-pass scheme this
+// supports: nodePing's own first pass (finalAttempt left false/undefined)
+// renders it as "⏳ ещё выполняется" (see index.ts's pingResultIcon) and
+// hands the still-open check IDs back as a PendingFollowUp instead of
+// silently reporting them failed - the real fix for a real user report:
+// a batch big enough (or a node underpowered enough) that some checks
+// legitimately don't finish within NODE_POLL_TIMEOUT_MS used to come back
+// completely indistinguishable from a real "no reply", even for targets
+// the node was still actively, successfully going to answer for a few
+// seconds later. No fixed budget (raising NODE_POLL_TIMEOUT_MS,
+// MaxConcurrentChecks, anything else agent- or bot-side) can fully rule
+// that out for an arbitrarily large batch or an arbitrarily slow node -
+// so instead of gambling on a bigger number being enough, index.ts's
+// caller now polls a second time in the background (not bound by
+// Telegraf's own handlerTimeout, since the initial reply has already been
+// sent) and sends a follow-up message once those specific checks actually
+// finish. finalAttempt=true is that second pass's own last call: if a
+// check is *still* pending even then, mergeNodeResults reports it as a
+// real, final failure (status stays false) with a distinct label instead
+// of "⏳" again - honest about having genuinely given up, not stuck
+// implying a follow-up is still coming when it isn't.
+export function mergeNodeResults(
   targets: string[],
   nodeId: string,
   routerName: string,
-  finished: Array<{ spec: CheckSpec; checks: any[] }>
+  finished: Array<{ spec: CheckSpec; checks: any[] }>,
+  finalAttempt = false
 ): any[] {
   return targets.map((target) => {
-    const out: any = { ip: target, resolved_ip: target, status: false, router_name: routerName };
+    const out: any = { ip: target, resolved_ip: target, status: false, pending: false, router_name: routerName };
     for (const { spec, checks } of finished) {
       const check = checks.find((c) => c.target === target);
       const run = check?.runs?.find((r: any) => r.node_id === nodeId);
       const result = run?.result;
+      const stillWaiting = !result && isCheckStillPending(check);
+      const givingUpNow = stillWaiting && finalAttempt;
+      if (stillWaiting && !givingUpNow) out.pending = true;
 
       const fields = parseRawFields(result?.raw);
 
@@ -249,11 +289,19 @@ function mergeNodeResults(
         if (result) {
           out.ICMP = formatIcmpSummary(fields.sent, fields.recv, result.latency_ms, translateCheckError(result.error_message));
           if (result.success) out.status = true;
+        } else if (givingUpNow) {
+          out.ICMP = 'нет ответа от узла (не дождались)';
+        } else if (stillWaiting) {
+          out.ICMP = 'ещё выполняется';
         }
       } else {
-        const state = result ? (result.success ? 'open' : 'closed') : 'unknown';
-        out[`port_${spec.port}`] = state;
-        if (state === 'open') out.status = true;
+        if (result) {
+          const state = result.success ? 'open' : 'closed';
+          out[`port_${spec.port}`] = state;
+          if (state === 'open') out.status = true;
+        } else {
+          out[`port_${spec.port}`] = givingUpNow ? 'таймаут' : stillWaiting ? 'ожидание' : 'unknown';
+        }
       }
 
       if (fields.resolvedTarget) out.resolved_ip = fields.resolvedTarget;
@@ -328,9 +376,16 @@ export function translateCheckError(message: string | null | undefined): string 
 // poisoned loopback address happens to answer on the exact port being
 // checked, from the backend's own local perspective. Filtering on status
 // alone used to silently drop censorship events from the very report the
-// 🚫 icon (see index.ts's pingResultIcon) was built to surface.
+// 🚫 icon (see index.ts's pingResultIcon) was built to surface. A pending
+// result (see mergeNodeResults' own doc comment) is excluded even though
+// status is false for it too - it isn't a confirmed failure, just not
+// answered *yet*, and a periodic health digest calling it a failure would
+// be exactly the false negative this whole two-pass scheme exists to stop
+// making.
 export function onlyFailed(results: any[]): any[] {
-  return results.filter((r) => r && typeof r === 'object' && ((r as any).status === false || (r as any).blocked === true));
+  return results.filter(
+    (r) => r && typeof r === 'object' && !(r as any).pending && ((r as any).status === false || (r as any).blocked === true)
+  );
 }
 
 // formatIcmpSummary is the "3 из 4" packet-loss display, plus the real
@@ -372,7 +427,28 @@ function parseRawFields(raw: unknown): { sent: number; recv: number; resolvedTar
   }
 }
 
-async function nodePing(targets: string[], nodeId: string, routerName: string, icmp: boolean, ports: string[]): Promise<{ results: any[] }> {
+// PendingCheck/PendingFollowUp/awaitPendingFollowUp implement the
+// two-pass scheme mergeNodeResults' own doc comment describes - one
+// PendingCheck per (target, spec) pair whose check_run hadn't finished by
+// the time nodePing's own poll gave up.
+export type PendingCheck = { spec: CheckSpec; checkId: string; target: string };
+export type PendingFollowUp = { nodeId: string; routerName: string; items: PendingCheck[] };
+
+// specKey groups PendingCheck entries back into mergeNodeResults' expected
+// Array<{spec, checks}> shape - "icmp" vs "port:N" is the only distinction
+// that matters (two different ports need two separate groups so a target
+// present in both doesn't get one spec's check silently dropped).
+function specKey(spec: CheckSpec): string {
+  return spec.kind === 'icmp' ? 'icmp' : `port:${spec.port}`;
+}
+
+async function nodePing(
+  targets: string[],
+  nodeId: string,
+  routerName: string,
+  icmp: boolean,
+  ports: string[]
+): Promise<{ results: any[]; pendingFollowUp?: PendingFollowUp }> {
   const specs: CheckSpec[] = [...(icmp ? [{ kind: 'icmp' as const }] : []), ...ports.map((port) => ({ kind: 'port' as const, port }))];
   if (specs.length === 0) return { results: [] };
 
@@ -387,7 +463,48 @@ async function nodePing(targets: string[], nodeId: string, routerName: string, i
     }))
   );
 
-  return { results: mergeNodeResults(targets, nodeId, routerName, finished) };
+  const items: PendingCheck[] = [];
+  for (const { spec, checks } of finished) {
+    for (const check of checks) {
+      if (isCheckStillPending(check)) {
+        items.push({ spec, checkId: String(check.id), target: String(check.target) });
+      }
+    }
+  }
+
+  return {
+    results: mergeNodeResults(targets, nodeId, routerName, finished),
+    pendingFollowUp: items.length > 0 ? { nodeId, routerName, items } : undefined
+  };
+}
+
+// awaitPendingFollowUp is the second pass: re-polls exactly the checks
+// nodePing's own first pass gave up on, this time with timeoutMs of fresh
+// patience (the caller - index.ts, not bound by Telegraf's handlerTimeout
+// once it's already sent the first reply - can afford to be far more
+// generous here than NODE_POLL_TIMEOUT_MS). Returns results only for the
+// targets that were actually still pending, in mergeNodeResults'
+// finalAttempt=true mode - see that function's doc comment for what that
+// changes. Returns [] immediately (no network calls at all) when there was
+// nothing pending, so an always-fast batch never pays for this.
+export async function awaitPendingFollowUp(followUp: PendingFollowUp, timeoutMs: number): Promise<any[]> {
+  const { nodeId, routerName, items } = followUp;
+  if (items.length === 0) return [];
+
+  const rechecked = await Promise.all(
+    items.map(async (item) => ({ spec: item.spec, check: await pollCheckUntilDone(item.checkId, timeoutMs) }))
+  );
+
+  const grouped = new Map<string, { spec: CheckSpec; checks: any[] }>();
+  for (const { spec, check } of rechecked) {
+    const key = specKey(spec);
+    const group = grouped.get(key) ?? { spec, checks: [] };
+    group.checks.push(check);
+    grouped.set(key, group);
+  }
+
+  const targets = [...new Set(items.map((i) => i.target))];
+  return mergeNodeResults(targets, nodeId, routerName, [...grouped.values()], true);
 }
 
 // ping mirrors the old astroping API's GET /api/ping contract exactly
@@ -397,7 +514,11 @@ async function nodePing(targets: string[], nodeId: string, routerName: string, i
 // anything else resolves to a node and goes through the async
 // checks/check_runs poll loop. Never takes a per-user token - the bot now
 // authenticates with one shared api_key (see the design spec, section 4).
-export async function ping(params: { ip_pool: string; router_name?: string; check_ports?: string }): Promise<{ results: any[] }> {
+export async function ping(params: {
+  ip_pool: string;
+  router_name?: string;
+  check_ports?: string;
+}): Promise<{ results: any[]; pendingFollowUp?: PendingFollowUp }> {
   const targets = params.ip_pool
     .split(',')
     .map((s) => s.trim())

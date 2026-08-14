@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { Markup, Telegraf, session, type Context } from 'telegraf';
 import { settingsRepo, userRepo } from './db';
 import * as apiClient from './pingachock-client';
-import type { Router } from './pingachock-client';
+import type { Router, PendingFollowUp } from './pingachock-client';
 
 type MySession = {
   awaitingAddUser?: boolean;
@@ -1260,12 +1260,18 @@ function startPeriodicHealthScheduler(bot: Telegraf<MyContext>) {
   }, 5000);
 }
 
-// pingResultIcon: 🚫 wins over the plain success/failure icon whenever
-// pingachock-client.ts flagged the result as DNS-poisoning-blocked (see
-// classifyBlocked there) - Turkmenistan's censorship signature, not a real
-// reachability failure, so it gets its own icon rather than looking like a
-// generic ❌.
+// pingResultIcon: ⏳ wins over everything else - a target whose check
+// hadn't finished when pingachock-client.ts's mergeNodeResults stopped
+// waiting on it (r.pending, see that function's doc comment) is neither a
+// success nor a failure yet, just unknown so far; a follow-up message
+// updates it once the node actually answers (see index.ts's
+// awaitPendingFollowUp wiring). Below that, 🚫 wins over the plain
+// success/failure icon whenever pingachock-client.ts flagged the result as
+// DNS-poisoning-blocked (see classifyBlocked there) - Turkmenistan's
+// censorship signature, not a real reachability failure, so it gets its
+// own icon rather than looking like a generic ❌.
 function pingResultIcon(r: any): string {
+  if (r?.pending) return '⏳';
   if (r?.blocked) return '🚫';
   return r?.status ? '✅' : '❌';
 }
@@ -1333,6 +1339,46 @@ function formatPingReport(params: {
   const allowedPorts = new Set(allowedPortsOrder);
   const lines = params.results.map((r) => formatPingResultLine(r, { allowedPorts, allowedPortsOrder }));
   return `${headerLines.join('\n')}\n\n${lines.join('\n')}`.trim();
+}
+
+// PENDING_FOLLOWUP_TIMEOUT_MS bounds the *second* pass over whatever
+// checks were still pending/running when the main ping report already had
+// to go out - see pingachock-client.ts's mergeNodeResults doc comment for
+// the full two-pass story this is one half of. Unlike NODE_POLL_TIMEOUT_MS,
+// this isn't bound by Telegraf's handlerTimeout at all: sendPendingFollowUps
+// fires it without awaiting, after the initial reply has already gone out,
+// so it can afford real patience for a large batch or an underpowered node
+// instead of gambling that some fixed number is "big enough" - 5 minutes,
+// not tuned to any specific hardware, just generous.
+const PENDING_FOLLOWUP_TIMEOUT_MS = 5 * 60 * 1000;
+
+// sendPendingFollowUps kicks off the second pass for every router that had
+// anything still pending after the first - deliberately not awaited by the
+// caller (see PENDING_FOLLOWUP_TIMEOUT_MS above for why). Each entry
+// independently sends its own follow-up message to this same chat once
+// (if) its checks actually finish; one that never resolves at all (network
+// dropped, process restarted) just never sends a follow-up rather than
+// blocking anything else - already strictly better than the false "failed"
+// this replaces, so erring toward silence on the failure path here is fine.
+function sendPendingFollowUps(
+  ctx: MyContext,
+  followUps: Array<{ routerLabel: string; followUp: PendingFollowUp }>,
+  checkPortsValue: string
+): void {
+  for (const { routerLabel, followUp } of followUps) {
+    void apiClient
+      .awaitPendingFollowUp(followUp, PENDING_FOLLOWUP_TIMEOUT_MS)
+      .then(async (extra) => {
+        if (extra.length === 0) return;
+        const allowedPortsOrder = parseRequestedPorts(checkPortsValue);
+        const allowedPorts = new Set(allowedPortsOrder);
+        const lines = extra.map((r) => formatPingResultLine(r, { allowedPorts, allowedPortsOrder }));
+        await ctx.reply(`🔁 Довыполнено (${routerLabel}) — были в ожидании:\n\n${lines.join('\n')}`);
+      })
+      .catch((err) => {
+        console.error('pending ping follow-up failed', err);
+      });
+  }
 }
 
 function chunkText(text: string, chunkSize: number = TELEGRAM_SAFE_TEXT_LIMIT): string[] {
@@ -2365,16 +2411,20 @@ bot.on('text', async (ctx, next) => {
 
     const executedAt = new Date();
 
-    const runPingBatches = async (routerName: string): Promise<any[]> => {
+    const runPingBatches = async (routerName: string): Promise<{ results: any[]; pendingFollowUps: PendingFollowUp[] }> => {
       const results: any[] = [];
+      const pendingFollowUps: PendingFollowUp[] = [];
       for (const batch of batches) {
         const ip_pool = batch.join(',');
         const data = await apiClient.ping({ ip_pool, router_name: routerName, check_ports: portsOpt.value });
         if (data && typeof data === 'object' && Array.isArray((data as any).results)) {
           results.push(...(data as any).results);
         }
+        if (data && typeof data === 'object' && (data as any).pendingFollowUp) {
+          pendingFollowUps.push((data as any).pendingFollowUp);
+        }
       }
-      return results;
+      return { results, pendingFollowUps };
     };
 
     try {
@@ -2387,8 +2437,10 @@ bot.on('text', async (ctx, next) => {
         }
 
         const sections: string[] = [];
+        const allFollowUps: Array<{ routerLabel: string; followUp: PendingFollowUp }> = [];
         for (const name of routerNames) {
-          const results = await runPingBatches(name);
+          const { results, pendingFollowUps } = await runPingBatches(name);
+          for (const followUp of pendingFollowUps) allFollowUps.push({ routerLabel: name, followUp });
           sections.push(
             `=== ${name} ===\n` +
               formatPingReport({
@@ -2411,9 +2463,11 @@ bot.on('text', async (ctx, next) => {
         } else {
           await ctx.reply(reportText);
         }
+
+        sendPendingFollowUps(ctx, allFollowUps, portsOpt.value);
       } else {
         const routerName = routerOpt.value;
-        const results = await runPingBatches(routerName);
+        const { results, pendingFollowUps } = await runPingBatches(routerName);
         const reportText =
           `=== ${routerName} ===\n` +
           formatPingReport({
@@ -2432,6 +2486,12 @@ bot.on('text', async (ctx, next) => {
         } else {
           await ctx.reply(reportText);
         }
+
+        sendPendingFollowUps(
+          ctx,
+          pendingFollowUps.map((followUp) => ({ routerLabel: routerName, followUp })),
+          portsOpt.value
+        );
       }
 
       await ctx.reply('Вы в главном меню', mainMenuKeyboard());
